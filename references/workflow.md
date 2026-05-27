@@ -1,6 +1,6 @@
 # 端到端工作流
 
-> 阶段总览：state 探测 → 环境校验 → A 章节切片 → B 初版 skill → C 章训练循环（含自适应阈值 + 每 ask_period 章回测）→ G 章间询问 + 末章总结
+> 阶段总览：state 探测 → 环境校验 → A 章节切片 → B 初版 skill → C 章训练循环（每章 baseline + max_attempts 次 Edit + 每 ask_period 章回测）→ G 章间询问 + 末章总结
 
 ## 阶段 0 — state 探测（启动第一动作）
 
@@ -135,22 +135,18 @@ Unit 全量读完前 K 章，**分两阶段**产出（详见 [output-skill-spec.
 
 ## 阶段 C — 章训练循环（i = K+1 ... 末章）
 
-### C.0 主 agent 每章动作清单
+### C.0 主 agent 每章动作清单（每章一律走完整流程，无特殊化）
 
 - [ ] **章前**：`state.in_flight = {chapter_index: i, started_at: <now>}`、`state.phase = "training"` → write-then-rename 原子写
 - [ ] **崩溃恢复检测**：glob `attempts/chapter-<NN3>/attempt-*/`，若任一 attempt 目录下有 `.commit-pending` 标记文件：删除该 attempt 整目录、用 `state.last_known_good.snapshot_dir` 整目录回滚 `<TARGET_SKILL>/`、删除 `attempts/chapter-<NN3>/` 重建空目录、再从 attempt-00 重训
-- [ ] **判定本章用什么 threshold**：
-  - i ∈ {K+1, K+2}（前两个训练章）：传 `threshold = 1.0`（不可达，强制走 baseline + 收集分数）；Training Unit 也会按"baseline 章不进 attempt-NN 循环"特例处理
-  - i ≥ K+3：传 `threshold = state.adaptive_threshold.value`
-- [ ] 用 [prompts/unit-training.md](prompts/unit-training.md) 模板构造提示词，填入：当前 i（3 位 padded）、上一章路径、真实本章路径、目标 SKILL.md 路径、attempts 子目录、日志路径、max_attempts、threshold、min_meaningful_improvement、最近 5 条 lesson 路径（若有）、最近一次回测的 summary 路径（若有，供 Summary 写 lesson 红线段时引用）
+- [ ] 用 [prompts/unit-training.md](prompts/unit-training.md) 模板构造提示词，填入：当前 i（3 位 padded）、上一章路径（**仅传路径，主 agent 不读**）、真实本章路径、目标 SKILL.md 路径、attempts 子目录、日志路径、max_attempts、min_meaningful_improvement、early_exit_score、最近 5 条 lesson 路径（若有）、最近一次回测的 summary 路径（若有，供 Summary 写 lesson 红线段时引用）
 - [ ] spawn Training Unit（subagent_type: general-purpose），等待返回
 - [ ] **章后**：
-  - 把 `chapter_index / final_score / attempts_used / threshold_met` 一行追加到 `alchemist-temp/progress.md`
-  - i = K+2 时：`state.adaptive_threshold.baseline_scores = [<chapter K+1 final>, <chapter K+2 final>]` → 计算 `state.adaptive_threshold.value = max(median(baseline_scores) + 0.05, params.min_threshold_floor)`、`state.adaptive_threshold.computed_after_chapter = K+2`
-  - i ≥ K+3 时：`state.adaptive_threshold.baseline_scores.append(final_score)` 但**不重新计算 value**（防漂移；阈值在 K+2 一次确定后稳定到训练末）
+  - 把 `chapter_index / baseline_score / final_score / growth / attempts_used / best_attempt` 一行追加到 `alchemist-temp/progress.md`
+  - append 一项到 `state.growth_history`：`{chapter, baseline, final, growth, best_attempt}`
   - `state.last_completed_chapter = i`、`state.in_flight = null`、`state.last_known_good = {snapshot_dir: ".../after-chapter-<NN3>", as_of_chapter: i}` → 原子写
-- [ ] **每 ask_period 章末（i ≡ 0 mod ask_period 且 i ≥ K+3 且非末章）**：spawn Regression Unit（详见 C.3）
-- [ ] **每 ask_period 章末（含 i = K+ask_period，但跳过 i = K+1 / K+2 这种非整除点）**且非末章 → AskUserQuestion 三选一
+- [ ] **每 ask_period 章末（i ≡ 0 mod ask_period 且 i ≥ K+3 且非末章）**：spawn Regression Unit（详见 C.2.1）
+- [ ] **每 ask_period 章末**且非末章 → AskUserQuestion 三选一
 - [ ] 否则直接进入 i+1
 
 ### C.1 Training Unit 内部时序
@@ -160,12 +156,12 @@ Unit 全量读完前 K 章，**分两阶段**产出（详见 [output-skill-spec.
 简版：
 
 ```
-准备 attempt-00（baseline，不动 skill）
+attempt-00（baseline，不动 skill）
   Execution → generated.md
   Scoring   → score.json + report.md（spawn 3 个独立裁判 sub-agent）
-  → score ≥ threshold ? 进入 Summary（标 best=00, decision=accept-implicit）
-                      : i ∈ {K+1, K+2} ? 仍直接进入 Summary（baseline 采集章）
-                      :                  进入 attempt-01
+  baseline_score = prev_best_score = overall_similarity
+  → 若 prev_best_score ≥ early_exit_score（默认 1.0，永不触发） : 进入 Summary
+  → 否则                                                          : 进入 attempt-01
 
 attempt-NN（NN ≥ 1，最多到 max_attempts）
   ── 事务标记入 ──
@@ -176,10 +172,9 @@ attempt-NN（NN ≥ 1，最多到 max_attempts）
   Edit     → 改 ≤ 3 处（每处 = 1 次 Edit/Write 工具调用），跳过高分歧（>0.2）维度 → 写 skill-changes.md
   Execution → generated.md
   Scoring   → score.json + report.md
-  Commit    → 看 score 与 prev_best：
-              ≥ threshold OR new > prev_best + min_meaningful_improvement → accept
-              微小提升（new > prev_best 但 < min_meaningful_improvement）  → rollback（防噪声拟合）
-              持平 / 下降                                                  → rollback
+  Commit    → 决策仅 2 分支：
+              new > prev_best + min_meaningful_improvement → accept；prev_best = new
+              其余（持平 / 下降 / 微小提升）                → rollback（防噪声拟合）
               rollback 路径：从 references-snapshot/ 整目录恢复 references/
                             从 skill-snapshot/ 恢复 SKILL.md
             → 写 commit-log.md
@@ -187,15 +182,19 @@ attempt-NN（NN ≥ 1，最多到 max_attempts）
   ── 事务标记出 ──
   ④ Remove-Item attempts/chapter-<NN3>/attempt-<NN2>/.commit-pending
 
-  → score ≥ threshold OR NN == max_attempts ? 进入 Summary : NN++
+  → 若 prev_best ≥ early_exit_score : 进入 Summary（best_attempt = 当前 NN）
+  → 若 NN == max_attempts            : 进入 Summary（跑满）
+  → 否则                              : NN++
 
 Summary
+  final_score = prev_best_score
+  growth = final_score - baseline_score
   读所有 attempt 的 score / commit-log / report
   → 提炼"哪类改动有效 / 无效"
-  → 写 alchemist-temp/lessons/lesson-<NN3>.md（含"红线"段：来自最近 regression summary 的劣化提醒）
+  → 写 alchemist-temp/lessons/lesson-<NN3>.md（含"红线"段：来自最近 regression summary 的劣化提醒；规则**抽象**无情节字面）
   → 写 attempts/chapter-<NN3>/summary.md
   → patch <TARGET_SKILL>/references/synopsis.md 三段（不再嵌 author-profile.json）
-  → append 一行 JSON 到 alchemist-temp/logs/training.jsonl
+  → append 一行 JSON 到 alchemist-temp/logs/training.jsonl（baseline_score / final_score / growth / best_attempt）
   → 章末快照：Copy-Item -Recurse <TARGET_SKILL>/ →
               <CWD>/alchemist-temp/snapshots/after-chapter-<NN3>/
 ```
@@ -205,44 +204,46 @@ Summary
 调度时机：每章末 i ≡ 0 mod ask_period 且 i ≥ K+3 且非末章。
 
 主 agent 调度动作：
-- 从 logs/training.jsonl 中取所有 threshold_met=true 且 chapter < i 的章节，随机抽 2 个
+- 从 logs/training.jsonl 中取所有 `growth > 0` 且 chapter < i 的章节，随机抽 2 个（B 模式没有 threshold_met，改用 growth > 0 作"曾有正向成长的章节"判定）
 - 用 [prompts/unit-regression.md](prompts/unit-regression.md) 模板构造提示词，spawn Regression Unit（subagent_type: general-purpose）
 - 接收返回的 deltas → 写入 state.regression.history、append 到 logs/regression.jsonl
 - 任一 delta < -0.05 → progress.md 加一行 🚨 红色记录、把 `regression/after-chapter-<NN3>/summary.md` 路径塞进下一章 Training Unit 提示词的"最近 regression summary"字段
 
-回测**不动 skill**——纯只读测试。
+回测**不动 skill**——纯只读测试。Regression Unit 自身**不读 source 章节正文**——仅 spawn Execution + Scoring 子 agent 读。
 
-### C.2.2 Training Unit 返回主 agent 的格式（严格）
+### C.2.2 Training Unit 返回主 agent 的格式（严格 B 模式）
 
 ```
-摘要：<≤ 80 字一句话>
+摘要：<≤ 80 字一句话，按"baseline X.XX → final Y.YY，成长 +Z.ZZ"格式>
 chapter_index: <i>
+baseline_score: <0.xxxx>
 final_score: <0.xxxx>
+growth: <+/-0.xxxx>
 best_attempt_id: <NN>
 attempts_used: <次数>
-threshold_met: true | false
+early_exit_triggered: true | false
 summary_path: <绝对路径>
 lesson_path: <绝对路径>
-failed_reason: <若未达阈值，一句话说明主要差距维度；否则 "N/A">
+snapshot_dir: <绝对路径>
 ```
 
-不允许在返回里贴生成稿 / 评分细节 / skill diff 全文。
+不允许在返回里贴生成稿 / 评分细节 / skill diff 全文。**B 模式取消** `threshold_met / failed_reason` 字段。
 
 ## 阶段 G — 章间询问 + 末章总结（主 agent 执行）
 
-### G.1 章间询问（每 5 章一次）
+### G.1 章间询问（每 ask_period 章一次）
 
 ```
-question: "已完成第 i 章（共 M 章）。最近 5 章平均分 X.XX，未达阈值章节 P 个。是否继续？"
+question: "已完成第 i 章（共 M 章）。最近 ask_period 章平均成长 +X.XX（baseline 中位 Y.YY → final 中位 Z.ZZ）。是否继续？"
 options:
   - "继续训练（推荐）" → 进入 i+1
   - "暂停训练"        → 输出当前进度后结束本次 skill 调用
   - "先看 progress"   → Read alchemist-temp/progress.md 全文打印 → 再次询问回到此处
 ```
 
-非询问周期 → 直接进入下一章，不打断用户。
+非询问周期 → 直接进入下一章，不打断用户。**B 模式询问文案禁用"达标 / 未达标"叙事**——只陈述成长数字。
 
-### G.2 末章总结
+### G.2 末章总结（成长曲线叙事，B 模式）
 
 末章 Training Unit 返回后，主 agent 写 `alchemist-temp/final-summary.md`：
 
@@ -255,30 +256,41 @@ options:
 - 种子章节数：K
 - 训练章节数：M - K
 
-## 通过情况
-- 达阈值章节数：P / (M-K)
-- 平均 final_score：X.XX
-- 中位数 final_score：Y.YY
-- 最差章节：第 j 章（X.XX，未达阈值）
-- 各维度全程平均：style: X.X | plot: X.X | character: X.X | tone: X.X | world: X.X | diction: X.X
+## 成长概览
+- 第一训练章 baseline：X.XX（章 K+1）
+- 最末训练章 final：Y.YY（章 M）
+- 全程平均 growth（per chapter）：+Z.ZZ
+- 全程累计 growth：+W.WW
+- growth > 0 章节占比：P / (M-K)
+- 最大单章成长：+0.XX（章 j）
+- 出现下降的章节数：Q（含原因主导维度统计）
+
+## 成长曲线（每章一行）
+| 章 | baseline | final | growth | best_attempt | early_exit |
+|---|---|---|---|---|---|
+| K+1 | 0.62 | 0.62 | +0.00 | 0 | no |
+| K+2 | 0.65 | 0.71 | +0.06 | 3 | no |
+| ... |
+
+## 维度全程平均（informational）
+- style: X.X | plot: X.X | character: X.X | tone: X.X | world: X.X | diction: X.X
+
+## 回测 / 红线触发
+- Regression 触发次数：R
+- 出现 delta < -0.05 的早期章节：[<chapters>]（提示后续训练可能在过拟合特定章节风格）
 
 ## 最终 skill
 - 落盘路径：<本 skill 同级目录>/<novel-slug>-quill/
 - 用法：用户跟 Claude 说"用 <novel-slug>-quill 续写：<前一章正文>"即可
 - 触发关键词（来自 SKILL.md description）：<copy 自 frontmatter>
 
-## 未达阈值章节清单
-| 章节 | final_score | top_gaps |
-|--|--|--|
-| j  | 0.82 | plot, character |
-| ...|
-
 ## 工作目录
 - alchemist-temp 路径：<绝对路径>
 - 训练日志：alchemist-temp/logs/training.jsonl
+- 状态文件：alchemist-temp/state.json
 ```
 
-输出一句话给用户："训练完成。最终 skill 已落盘：`<path>`。详见 `<final-summary 路径>`。"
+输出一句话给用户："训练完成。M-K 个训练章里 P 个有正向成长，累计 +W.WW。最终 skill 已落盘：`<path>`。详见 `<final-summary 路径>`。"
 
 ### G.3 暂停路径
 
@@ -297,7 +309,7 @@ options:
 
 ### G.4 失败兜底
 
-任一 Training Unit 返回的 `failed_reason` 显示非常规错误（如"SKILL.md 写入失败"）：
+任一 Training Unit 返回 `status = "error"` 且 `error` 字段含非常规错误（如"SKILL.md 写入失败"）：
 
 1. 主 agent 把错误原样展示给用户
 2. `state.phase = "error"`、`state.errors.append({chapter, error_msg, ts})` → 原子写

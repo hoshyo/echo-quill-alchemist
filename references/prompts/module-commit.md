@@ -19,8 +19,9 @@
 - 当前 references 目录：<TARGET_SKILL>/references/
 - prev_best_score（之前历次 attempt 的最高 overall）：<float>
 - 本次 overall_similarity（来自 score.json）：<float>
-- 通过阈值 threshold：<float>
 - min_meaningful_improvement：0.005（默认）
+
+> **B 模式无 threshold 概念**：本框架不预设"分数 ≥ X 即合格"。Commit 决策**只关心相对增量**，不关心绝对值是否够高。
 
 【你必读】
 - score.json（本次 attempt）
@@ -33,32 +34,30 @@
 - 历史 attempts 的 score.json（已通过 prev_best_score 数值传递）
 - 后续章节 / 训练日志 / state.json / lessons/ / snapshots/
 
-【决策逻辑（严格按下列优先级，不允许自由发挥）】
+【决策逻辑（严格 2 分支，不允许自由发挥）】
 
 ```
 读 score.json 得 new_score, high_disagreement_axes
 读 skill-changes.md 得 edits_count, edited_files
 delta = new_score - prev_best_score
 
-if new_score >= threshold:
+if delta > min_meaningful_improvement:    # 即 delta > 0.005
     decision = "accept"
-    rationale = "达通过阈值"
-elif delta > min_meaningful_improvement:    # 即 delta > 0.005
-    decision = "accept"
-    rationale = f"显著超越历史最高（+{delta:.4f}）"
-elif delta > 0:
-    # 微小提升（0 < delta <= 0.005）默认 rollback —— 防噪声拟合
-    # 旧策略采纳了微小提升，但 LLM 裁判采样自然方差通常 ≥ 这个量级，
-    # 把噪声当信号会让 skill 越变越复杂、最终过拟合
-    decision = "rollback"
-    rationale = f"微小提升（+{delta:.4f} ≤ {min_meaningful_improvement}）落入裁判采样噪声带，回滚以避免噪声拟合"
+    rationale = f"显著成长 (+{delta:.4f})"
 else:
-    # 持平或下降
+    # 涵盖：微小提升、持平、下降
     decision = "rollback"
-    rationale = f"未超越历史最高（new={new_score:.4f}, prev_best={prev_best_score:.4f}）"
+    if delta > 0:
+        rationale = f"微小提升 (+{delta:.4f} ≤ {min_meaningful_improvement}) 落入裁判采样噪声带，回滚避免噪声拟合"
+    else:
+        rationale = f"未超越历史最高 (delta={delta:.4f}; new={new_score:.4f}, prev_best={prev_best_score:.4f})"
 ```
 
-> 决策树共 4 分支，去掉了"微小提升采纳"这一旧分支。理由见 scoring-rubric.md 的"局限性声明"——同模型多次采样的自然方差可达 0.01-0.02，远大于 min_meaningful_improvement=0.005，把这个量级的提升当真会让 skill 拟合噪声。
+> **B 模式决策树只有 2 分支**：要么"显著成长 → accept"，要么"否则 → rollback"。
+>
+> 理由见 scoring-rubric.md 的"局限性声明"——同模型多次采样的自然方差可达 0.01-0.02，远大于 min_meaningful_improvement=0.005。把这个量级的"提升"当真会让 skill 拟合噪声。
+>
+> 删掉的旧分支：① "达 threshold 即接受"（B 模式无 threshold）② "微小提升 + 低分歧维度即接受"（已被信号噪声分析否决）③ "微小提升 + 高分歧即回滚"（被并入统一 rollback）。
 
 【执行】
 
@@ -96,8 +95,8 @@ else:
 - new_score: 0.xxxx
 - prev_best_score: 0.xxxx
 - delta: <+/->.xxxx
-- threshold: 0.xx
-- threshold_met: true | false
+- min_meaningful_improvement: 0.005
+- significant_growth: true | false  (= delta > min_meaningful_improvement)
 - edits_count: <int>
 - edited_files: ["<path>", ...]
 - high_disagreement_axes: [...]
@@ -124,7 +123,8 @@ else:
   "new_score": 0.xxxx,
   "prev_best_score_before": 0.xxxx,
   "new_prev_best": 0.xxxx,
-  "threshold_met": true | false,
+  "delta": <+/-0.xxxx>,
+  "significant_growth": true | false,
   "commit_log_path": "<absolute>",
   "error": "<error 时一句话>"
 }

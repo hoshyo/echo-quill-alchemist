@@ -200,8 +200,9 @@ dim_disagreement = max(judges) - min(judges)
 
 ## 总分
 - overall_similarity: 0.xxxx
-- 通过阈值（自适应 = X.XX）：是 / 否
 - top_gaps: [<axis-1>, <axis-2>]
+
+> **B 模式无"通过阈值"概念**：本文件不再判定"达标 / 未达标"；overall_similarity 是给 Commit Module 与 Training Unit 计算 delta 用的纯数字。
 
 ## 三裁判一致性
 | 维度 | judge-A | judge-B | judge-C | 中位数 | 分歧度 | 标记 |

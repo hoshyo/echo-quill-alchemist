@@ -125,8 +125,8 @@
   "params": {
     "K": 3,
     "max_attempts": 5,
-    "min_threshold_floor": 0.85,
     "min_meaningful_improvement": 0.005,
+    "early_exit_score": 1.0,
     "ask_period": 5
   },
 
@@ -137,11 +137,11 @@
   "next_chapter": 8,
   "in_flight": null,
 
-  "adaptive_threshold": {
-    "value": 0.78,
-    "computed_after_chapter": 5,
-    "baseline_scores": [0.71, 0.74, 0.69]
-  },
+  "growth_history": [
+    {"chapter": 4, "baseline": 0.62, "final": 0.62, "growth": 0.00, "best_attempt": 0},
+    {"chapter": 5, "baseline": 0.65, "final": 0.71, "growth": 0.06, "best_attempt": 3},
+    {"chapter": 6, "baseline": 0.69, "final": 0.74, "growth": 0.05, "best_attempt": 2}
+  ],
 
   "last_known_good": {
     "snapshot_dir": "<CWD>/alchemist-temp/snapshots/after-chapter-007/",
@@ -165,6 +165,29 @@
 ```
 
 `in_flight` 在章训练循环开始前写入 `{"chapter_index": <int>, "started_at": "<ISO>"}`，章末 Summary 完成后置回 `null`。续跑时见到非 null `in_flight` → 走"该章中断恢复"路径。
+
+`growth_history` 由 Main Agent 在每章末追加一项；不重写。这是"成长曲线"的机器可读底座，progress.md 是其人类可读视图。
+
+## logs/training.jsonl 字段（B 模式）
+
+每章一行 JSON。字段：
+
+```json
+{
+  "chapter_index": 7,
+  "baseline_score": 0.69,
+  "final_score": 0.74,
+  "growth": 0.05,
+  "attempts_used": 5,
+  "best_attempt": 2,
+  "early_exit_triggered": false,
+  "ts": "<ISO 8601>"
+}
+```
+
+**已删除字段**（B 模式不再有）：`threshold_met`、`failed_reason`、`is_baseline_only`、`final_similarity`（改名 `final_score`）。
+
+`growth = final_score - baseline_score`；可正可负可零（负 = 本章 Edit 全部被回滚，最终保留 baseline；零 = 本章 Edit 全部触发微小提升回滚或 baseline 已最优）。
 
 ## 文件大小预算
 

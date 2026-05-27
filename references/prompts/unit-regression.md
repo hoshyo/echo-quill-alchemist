@@ -15,11 +15,10 @@
 
 【输入参数】
 - 检查点章节序号：i（int），padded 形式 NN3（即"在完成第 i 章训练后做的回测"）
-- 待回测章节列表：[{chapter: <int>, original_final_score: <float>, file_path: <CWD>/alchemist-temp/source/chapter-<MM3>.md}, ...]（Main Agent 从 logs/training.jsonl 中过滤 threshold_met=true 且 chapter < i 的章节，随机抽 2 个）
+- 待回测章节列表：[{chapter: <int>, original_final_score: <float>, file_path: <CWD>/alchemist-temp/source/chapter-<MM3>.md}, ...]（Main Agent 从 logs/training.jsonl 中过滤 growth > 0 且 chapter < i 的章节，随机抽 2 个）
 - 当前 skill 路径：<TARGET_SKILL>/SKILL.md（最新版本）
 - 当前 references 目录：<TARGET_SKILL>/references/（最新版本）
 - 输出根目录：<CWD>/alchemist-temp/regression/after-chapter-<NN3>/
-- 评分阈值（信息用）：threshold = state.adaptive_threshold.value
 - 劣化判定阈值：delta_alarm = -0.05（绝对差，新-旧）
 
 【你的内部时序】
@@ -74,11 +73,24 @@
 
 {"check_after_chapter": <i>, "checked_chapters": [<M1>, <M2>], "deltas": [{"chapter": M1, "original": 0.86, "new": 0.84, "delta": -0.02}, ...], "any_alarm": <bool>, "ts": "<ISO 8601>"}
 
-【你绝不读】
-- 当前章节训练状态（progress.md / state.json / 当前章 attempts/）—— 避免被"现在还在训第 i 章"的现实污染早期章回测
-- 后续章节
-- 历史 attempts / 早期章节的训练日志细节
-- 其它回测的产出
+【你自身的隔离硬规则（与 Training Unit 同级）】
+
+❌ 你**绝不** Read 以下文件的内容：
+  - source/chapter-*.md 任何章节（含被回测的章节本身——仅传路径给 Execution / Scoring）
+  - <TARGET_SKILL>/SKILL.md / references/* 任何文件（你不动 skill，无需读）
+  - 任何 generated.md（仅传路径给 Scoring）
+  - 任何 attempt 的 scoring-context.md / report.md / judges/*
+  - 当前章节训练状态（progress.md / state.json / 当前章 attempts/）—— 避免被"现在还在训第 i 章"的现实污染早期章回测
+  - 后续章节
+  - 历史 attempts / 早期章节的训练日志细节
+  - 其它回测的产出
+
+✅ 你**允许**做的：
+  - Read 子 agent 返回的小数字字段：每个 replay-chapter-<MM3>/score.json 取 overall_similarity（仅这一个字段，不读 axes / report）
+  - Glob 列目录
+  - 写入 regression/after-chapter-<NN3>/ 子目录下的产出 + append logs/regression.jsonl
+
+理由：你是回测调度器，对内容透明 = 回测信号纯粹来自子 agent 独立打分，不被你的上下文带偏。
 
 【你绝不动】
 - 任何 <TARGET_SKILL>/ 下的文件
@@ -90,6 +102,7 @@
 - [ ] regression.jsonl 已 append 一行
 - [ ] 任一 delta < -0.05 时，summary.md 顶部已标 🚨
 - [ ] 未修改 <TARGET_SKILL>/ 下任何文件
+- [ ] **自身未 Read** 任何章节正文 / SKILL.md / references / generated.md / report.md / scoring-context.md
 - [ ] 未读其它章节的 attempts / 当前章节的训练状态
 
 【返回 Main Agent（严格 JSON）】

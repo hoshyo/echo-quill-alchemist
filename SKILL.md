@@ -30,9 +30,10 @@ Main Agent（用户主对话，全局唯一，仅做调度）
 **架构硬规则**：
 - 没有"孙子 agent"——主 agent 启动 unit，unit 启动 sub-agent，sub-agent 也可以启动 sub-agent，统一称 sub-agent。
 - Main Agent 不接触章节正文 / 生成稿 / 评分细节 / skill diff，只做调度、状态管理、用户询问。
+- **Unit 自身亦不读章节正文 / SKILL.md / generated.md** —— Unit 是调度器，对内容透明（仅 Copy-Item / Glob / 传路径），读内容是其内部 sub-agent 的事。
 - 一个 Unit 完成职责后被 kill，上下文不延续；信息通过文件（state.json / lesson / log / snapshot）传递给下一单元。
 - 运行环境无 git。所有回滚 / 历史追溯靠文件快照（每章末镜像到 snapshots/after-chapter-NNN/）。
-- 自适应阈值：前两个训练章（i = K+1, K+2）只跑 baseline 收集分数；i = K+2 时算 `threshold = max(median(baseline) + 0.05, min_threshold_floor)`，之后稳定到末章。
+- **训练目标 = 章间相对成长，不是绝对分数**：每章一律跑 attempt-00 baseline + 1..max_attempts 次 Edit；章末选历史最高分 attempt（受 min_meaningful_improvement = 0.005 噪声闸过滤）；不设"通过 / 未通过"二元判定。可选 `early_exit_score`（默认 1.0 即关闭）仅作算力优化的提前退出。
 
 详细分工见 [references/architecture.md](references/architecture.md)。
 
@@ -52,14 +53,16 @@ Main Agent（用户主对话，全局唯一，仅做调度）
 | 小说来源 | ✅ | — | 二选一：(A) 整本文件路径（.txt/.md，UTF-8）；(B) 按章节顺序排列的 URL 列表 |
 | 目标 skill 名 | 可选 | `<novel-slug>-quill` | 从小说标题或文件名 slug 化 |
 | 种子章节数 K | 可选 | 自适应 | 总章数 N≥5→K=3；N=4→K=2；N=3→K=1；N<3 拒绝执行 |
-| 单章最大尝试数 | 可选 | 5 | 某章尝试到此仍未达阈值则带 warning 推进 |
-| `min_threshold_floor` | 可选 | 0.85 | 自适应阈值的兜底下限。实际阈值 = `max(median(前两训练章 baseline 分) + 0.05, min_threshold_floor)`，从 i = K+3 起生效 |
-| `min_meaningful_improvement` | 可选 | 0.005 | Commit 决策门槛——新分数超过 prev_best 多少才算"显著提升"。低于此值默认 rollback 防噪声拟合 |
-| 暂停询问周期 ask_period | 可选 | 5 | 每完成 N 章问一次"继续 / 暂停 / 看 progress"；同时是 Regression Unit 的调度周期 |
+| `max_attempts` | 可选 | 5 | 每章固定跑 attempt-00 baseline + 1..max_attempts 次 Edit。**章末选历史最高分 attempt 落盘**，无所谓"达不达标" |
+| `min_meaningful_improvement` | 可选 | 0.005 | Commit 决策门槛——新分数超过 prev_best 至少这么多才 accept；否则 rollback。**这是防噪声拟合的核心闸**，落入 LLM 裁判采样自然方差带的"伪提升"被滤掉 |
+| `early_exit_score` | 可选 | 1.0 | 仅算力优化：prev_best 达此值即提前停跑（默认 1.0 = 永不触发，跑满 max_attempts）。需要省算力的训练可显式设 0.95 |
+| 暂停询问周期 `ask_period` | 可选 | 5 | 每完成 N 章问一次"继续 / 暂停 / 看 progress"；同时是 Regression Unit 的调度周期 |
 
 任一必需项缺失：停下问用户，不得猜测。
 
 > **续跑场景下，启动参数收集被跳过** —— Main Agent 检测到 `<CWD>/alchemist-temp/state.json` 存在，会直接按 state 中的 params 续跑。
+
+> **没有"通过阈值"概念**：本框架不预设"分数 ≥ X 即合格"。续写 skill 训练里"够好"没有客观定义；唯一可观测的是**章间相对成长**（baseline → final）。日志、final-summary 都按成长曲线叙事。
 
 ## 工作目录
 
@@ -74,13 +77,12 @@ Main Agent（用户主对话，全局唯一，仅做调度）
 3. spawn **Fetch Source Unit** → 切片到 `alchemist-temp/source/` + 输出 chapter_hashes 写 state
 4. 检查总章数：N<3 → 停下；N≥3 → 按公式定 K
 5. spawn **Init Skill Unit** → 分两阶段产 5 件套（author-profile.json + character-cards/*.md + world-bible.md → 自校验通过 → SKILL.md + synopsis.md + style-rules.md）。Main Agent 二次校验（glob character-cards 数 + JSON schema）
-6. 章训练循环（i = K+1 ... 末章）：
+6. 章训练循环（i = K+1 ... 末章），**所有章节同一流程**（无 baseline 采集章特殊化）：
    - 章前写 state.in_flight；崩溃恢复检测（孤立 .commit-pending → 整章重训）
-   - i ∈ {K+1, K+2}：仅跑 baseline 收集分数；i = K+2 后算自适应阈值
-   - i ≥ K+3：使用自适应阈值
-   - 每章 spawn 新 **Training Unit**，等返回；章末更新 state.last_known_good
+   - 每章 spawn 新 **Training Unit**：跑 attempt-00 baseline + 1..max_attempts，章末选历史最高分 attempt
+   - 章末更新 state.last_known_good；progress.md 记 baseline / final / growth
 7. 每 ask_period 章末（i ≥ K+3 且非末章）spawn **Regression Unit** 回测；询问用户继续 / 暂停 / 看 progress
-8. 末章后写 `final-summary.md`，state.phase = "done"，输出落盘路径
+8. 末章后写 `final-summary.md`（成长曲线叙事），state.phase = "done"，输出落盘路径
 
 详见 [references/workflow.md](references/workflow.md)。
 
