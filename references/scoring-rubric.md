@@ -4,6 +4,14 @@
 >
 > 评分模式：**裁判团 / Ensemble**——每个裁判**独立**对全部 6 维各打 0-1 分；3 份分数聚合后加权得 overall。
 
+## 局限性声明（裁判与 Edit Module 必读，影响信号解释）
+
+3 个裁判都是 general-purpose sub-agent 调用，底层是同一个 LLM 多次采样。这是**成本受限下的近似 ensemble，不是真正独立的多评判模型**：
+- 三裁判的 score 之间 Pearson 相关大概率 > 0.7
+- "中位数抗极端"假设当 1 个裁判极端打分异常时成立，但若**3 个裁判共享同一系统性偏差**（如对短句倾向、对成语偏好），中位数也会系统性错
+- 因此：`disagreement` 反映的是同模型采样自然方差 + 提示词敏感度，**不能**等同于"客观真实信号稳定度"
+- 工程取舍：把"分歧度阈值"定得偏严（≤ 0.2 才算稳定），减少把噪声当信号的概率
+
 ## 评分模式
 
 ```
@@ -33,6 +41,14 @@ Scoring Agent（Training Unit 启动）
 ```
 overall_similarity = sum(dim_median * weight)，结果保留 4 位小数
 ```
+
+## 字数比例检查（informational，不进评分）
+
+`字数比 = N2 / N1`（生成 / 真实）。仅写入 report.md 顶部信息块：
+- `0.7 ≤ ratio ≤ 1.3` → 正常
+- `ratio < 0.7` 或 `ratio > 1.3` → 标 ⚠️：Execution 字数偏离设定，plot.2.2 命中率天然受限。Edit Module 解读 plot 维度差距时**应优先认定为 Execution 失误而非 skill 缺陷**
+
+字数差异**不**直接扣 plot 分（避免双重扣分），但作为归因的旁证。
 
 ## 各维度打分细则（裁判遵循）
 
@@ -123,10 +139,14 @@ overall_similarity = sum(dim_median * weight)，结果保留 4 位小数
 dim_median = median([judge_A.score, judge_B.score, judge_C.score])
 dim_weighted = dim_median * weight
 overall_similarity = sum(dim_weighted)
-top_gaps = 按 (1 - dim_median) * weight 降序取前 2 维（最值得改的两维）
+disagreement = max(scores) - min(scores)
+high_disagreement_axes = [dim for dim where disagreement > 0.2]
+top_gaps = 按 (1 - dim_median) * weight 降序，**排除** high_disagreement_axes，取前 2
 ```
 
 **为什么用中位数而非平均**：抗单个裁判的极端打分（一个裁判给 0 不会拉死整个维度）。
+
+**为什么 top_gaps 排除高分歧维度**：top_gaps 是给 Edit Module 的修改优先级——基于不稳定信号修改 = 噪声拟合。
 
 ## 三裁判分歧处理
 
@@ -136,10 +156,16 @@ top_gaps = 按 (1 - dim_median) * weight 降序取前 2 维（最值得改的两
 dim_disagreement = max(judges) - min(judges)
 ```
 
-- 任一维 `disagreement > 0.3` → report.md 标 ⚠️ "高分歧维度"，提示后续 Edit 谨慎对待
-- 任一维 `disagreement > 0.5` → report.md 标 🚨 "严重分歧"，建议人工 review
+- 任一维 `disagreement > 0.2` → report.md 标 ⚠️ "高分歧维度"，**Edit Module 本轮不动该维度**（信号不稳，避免误改）
+- 任一维 `disagreement > 0.4` → report.md 标 🚨 "严重分歧"，建议人工 review
+
+> **为什么 0.2 而不是历史的 0.3**：见局限性声明——同模型多次采样的自然方差通常 ≥ 0.1，把"稳定阈值"卡在 0.2 才能滤掉一半噪声。要打动 Edit 必须 disagreement ≤ 0.2 + delta ≥ min_meaningful_improvement 双闸口同时通过。
 
 分歧不影响 overall 计算（仍用中位数），但影响 Commit Module 的决策（高分歧维度的微小提升不算"显著改进"）。
+
+### 高分歧逃生通道（避免某维永远不收敛）
+
+如果同一维度在连续 3 章里都 disagreement > 0.2 → Summary Module 在 lesson 中标"该维度长期高分歧"，下一章 Edit Module 允许在该维度做**单处小幅试探**（仅 1 条规则、措辞中性），观察 delta 走向。试探仍属于"≤ 3 处"配额内。
 
 ## 噪声忽略清单（不计入差异）
 
@@ -166,9 +192,15 @@ dim_disagreement = max(judges) - min(judges)
 ```markdown
 # 第 <i> 章 attempt-<NN> 评分报告
 
+## 客观指标（informational）
+- 真实字数：N1
+- 生成字数：N2
+- 字数比：N2/N1 = X.XX
+- 字数比是否超 ±30%：是 / 否（超 → ⚠️ Edit Module 解读 plot 时优先归因 Execution 失误）
+
 ## 总分
 - overall_similarity: 0.xxxx
-- 通过阈值（≥ 0.85）：是 / 否
+- 通过阈值（自适应 = X.XX）：是 / 否
 - top_gaps: [<axis-1>, <axis-2>]
 
 ## 三裁判一致性
@@ -196,7 +228,8 @@ dim_disagreement = max(judges) - min(judges)
 ## 给 Edit Module 的指引
 - 优先修补 top_gaps 中第 1 维：<axis>，建议加 <一句话规则草案>
 - 次优先：<axis>
-- 高分歧维度（disagreement > 0.3）本轮**不动**——避免基于不稳定信号改写
+- 高分歧维度（disagreement > 0.2）本轮**不动**——避免基于不稳定信号改写
+- 长期高分歧维度（连续 3 章命中）：lesson 已批准小幅试探（≤ 1 条中性规则）
 ```
 
 ## score.json 字段约束
@@ -225,4 +258,5 @@ dim_disagreement = max(judges) - min(judges)
 - 每维 median ∈ [0, 1]
 - weighted = median * weight，浮点误差 ≤ 1e-4
 - overall_similarity = sum(weighted)，误差 ≤ 1e-4
+- high_disagreement_axes = [dim where disagreement > 0.2]（注意：阈值 0.2，不是历史的 0.3）
 - top_gaps 排除 high_disagreement_axes（高分歧维度不进 top_gaps，因为信号不稳定）

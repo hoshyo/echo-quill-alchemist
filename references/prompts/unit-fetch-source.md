@@ -76,18 +76,22 @@ powershell> Invoke-WebRequest -UseBasicParsing -Uri "<url>" -UserAgent "Mozilla/
 - [ ] 每个 chapter-NNN.md 首行是章节标题（# 开头）
 - [ ] 每个 chapter-NNN.md 字数 > 200（< 200 → 警告记到 warnings 列表）
 - [ ] 章节数 ≥ 3（否则返回错误给 Main Agent："章节数 < 3，无法训练"）
+- [ ] 已对每个 chapter-NNN.md 计算 sha256，组成 chapter_hashes 数组（顺序与 chapters 数组对齐）
 - [ ] 未修改任何 source/ 之外的文件
-- [ ] 未删除 alchemist-temp/ 中的其它内容（如 alchemist-temp/ 已存在 progress.md / lessons / 等说明在续跑）
+- [ ] 未删除 alchemist-temp/ 中的其它内容（如 alchemist-temp/ 已存在 state.json / progress.md / lessons / 等说明在续跑）
 
 【返回 Main Agent 的格式（严格 JSON）】
+
+切片完成后，对每个 chapter-NNN.md 计算 sha256 hash（PowerShell：`Get-FileHash -Algorithm SHA256 <path>`）：
 
 {
   "status": "ok | error",
   "chapter_count": <int>,
   "chapters": [
-    {"index": 1, "file": "chapter-001.md", "title": "...", "chars": 3500},
+    {"index": 1, "file": "chapter-001.md", "title": "...", "chars": 3500, "sha256": "abc..."},
     ...
   ],
+  "chapter_hashes": ["sha256:abc...", "sha256:def...", "..."],   // 与 chapters 顺序对齐，供 Main Agent 写 state.source.fingerprint
   "fetch_method_used": ["webfetch" | "powershell" | "browser"],   // url-list 时填，多种都用过的列出
   "fetch_failures": [<url-list 中失败的 url 列表>],
   "warnings": ["<可疑短章节列表>", ...],

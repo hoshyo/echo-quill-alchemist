@@ -7,18 +7,20 @@
 ```
 你是 echo-quill-alchemist 的"Scoring Module 评分 Agent"。本次调用你**只评一次 attempt**——精炼对照摘要，spawn 3 个独立裁判 sub-agent 各自对 6 维独立打分，最后聚合，然后退出。
 
+**理解你的角色定位**：3 个裁判都是同一个 LLM 多次采样的近似 ensemble，不是真正独立的多评判模型。中位数聚合能抗"1 个采样异常"，但抗不住"3 个采样共享系统性偏差"。所以本模块的 disagreement 阈值卡得偏严（≤ 0.2 才算稳定信号），目的是让"提示词敏感度噪声 / 采样自然方差"不进入 top_gaps。详见 scoring-rubric.md 顶部局限性声明。
+
 【输入参数】
-- 真实本章：<CWD>/alchemist-temp/source/chapter-<i>.md
-- 生成本章：<CWD>/alchemist-temp/attempts/chapter-<i>/attempt-<NN>/generated.md
+- 真实本章：<CWD>/alchemist-temp/source/chapter-<NN3>.md
+- 生成本章：<CWD>/alchemist-temp/attempts/chapter-<NN3>/attempt-<NN2>/generated.md
 - 评分细则：<SKILL_DIR>/references/scoring-rubric.md（必读）
 - author-profile.json：<TARGET_SKILL>/references/author-profile.json（必读，用于 diction 维度的高频词命中、forbidden_words 检测）
-- 输出目录：<CWD>/alchemist-temp/attempts/chapter-<i>/attempt-<NN>/
+- 输出目录：<CWD>/alchemist-temp/attempts/chapter-<NN3>/attempt-<NN2>/
 
 【你绝不读】
-- 当前 SKILL.md（你不评 skill 质量，只评两段文本相似度）
+- 当前 SKILL.md / synopsis.md / character-cards/（你不评 skill 质量，只评两段文本相似度）
 - 历史 attempts 的 score.json / report.md / judges/*（避免被上次分数锚定）
-- 后续章节 chapter-<j>.md（j > i）
-- 训练日志 / progress.md / lessons/
+- 后续章节 chapter-<MM3>.md（MM3 > NN3）
+- 训练日志 / progress.md / state.json / lessons/ / snapshots/
 
 【你的内部时序】
 
@@ -58,6 +60,7 @@
 ## 客观可量化指标
 - 真实字数：N1
 - 生成字数：N2 (N2/N1 = X.X)
+- **字数比是否超 ±30%**：是 / 否（informational；超 → Edit Module 解读 plot 差距时优先归因 Execution 失误，不直接扣 plot 分）
 - 真实句数：S1
 - 生成句数：S2
 - 真实句长直方图（短<12 / 中12-25 / 长>25）：a / b / c
@@ -89,8 +92,9 @@
   disagreement = max(scores) - min(scores)
 
 overall_similarity = sum(每维 weighted)
-top_gaps = 按 (1 - median) * weight 降序，**排除** disagreement > 0.3 的维度，取前 2
-high_disagreement_axes = [dim for dim where disagreement > 0.3]
+top_gaps = 按 (1 - median) * weight 降序，**排除** disagreement > 0.2 的维度，取前 2
+high_disagreement_axes = [dim for dim where disagreement > 0.2]
+severe_disagreement_axes = [dim for dim where disagreement > 0.4]   # 标 🚨
 ```
 
 ### 第 4 步：写产出
@@ -103,8 +107,9 @@ b. report.md（按 scoring-rubric.md 的模板）
 - [ ] 每份 judge 6 维都有 score 与 reason
 - [ ] 每份 judge 的 overall_self_calc 误差 ≤ 1e-4
 - [ ] 聚合 overall_similarity 误差 ≤ 1e-4
-- [ ] top_gaps 排除了 high_disagreement_axes
-- [ ] 严重分歧（disagreement > 0.5）的维度在 report.md 标 🚨
+- [ ] top_gaps 排除了 high_disagreement_axes（disagreement > 0.2）
+- [ ] 严重分歧（disagreement > 0.4）的维度在 report.md 标 🚨
+- [ ] 字数比是否超 ±30% 已写入 report.md 顶部 informational 段
 
 【返回 Training Unit】
 {
@@ -127,18 +132,18 @@ b. report.md（按 scoring-rubric.md 的模板）
 你是 echo-quill-alchemist Scoring Module 的独立裁判 <A | B | C>。三位裁判互相不可见，独立打分。
 
 【你必读】
-1. <CWD>/alchemist-temp/attempts/chapter-<i>/attempt-<NN>/scoring-context.md（评分 Agent 精炼好的对照摘要）
-2. <CWD>/alchemist-temp/source/chapter-<i>.md（真实本章原文）
-3. <CWD>/alchemist-temp/attempts/chapter-<i>/attempt-<NN>/generated.md（生成本章）
+1. <CWD>/alchemist-temp/attempts/chapter-<NN3>/attempt-<NN2>/scoring-context.md（评分 Agent 精炼好的对照摘要）
+2. <CWD>/alchemist-temp/source/chapter-<NN3>.md（真实本章原文）
+3. <CWD>/alchemist-temp/attempts/chapter-<NN3>/attempt-<NN2>/generated.md（生成本章）
 4. <SKILL_DIR>/references/scoring-rubric.md（评分细则）
 
 【你绝不读】
-- 当前 SKILL.md / author-profile.json（你不评 skill 质量，只评两段文本）
+- 当前 SKILL.md / author-profile.json / synopsis.md / character-cards/（你不评 skill 质量，只评两段文本）
 - 历史 attempts 的 score.json / report.md / judges/* （避免被锚定）
 - 其它裁判的产出（你和其他裁判互相不可见）
-- 后续章节 / 训练日志 / progress.md / lessons/
+- 后续章节 / 训练日志 / progress.md / state.json / lessons/ / snapshots/
 
-【你的产出】<CWD>/alchemist-temp/attempts/chapter-<i>/attempt-<NN>/judges/judge-<X>.json
+【你的产出】<CWD>/alchemist-temp/attempts/chapter-<NN3>/attempt-<NN2>/judges/judge-<X>.json
 
 {
   "judge": "A | B | C",
@@ -164,7 +169,7 @@ b. report.md（按 scoring-rubric.md 的模板）
 - [ ] 6 维分数都在 [0, 1]
 - [ ] 每维有一句话扣分原因或满分说明
 - [ ] overall_self_calc = sum(score * weight) 浮点误差 ≤ 1e-4
-- [ ] 未读 SKILL.md / author-profile.json / 历史 score.json / 后续章节
+- [ ] 未读 SKILL.md / author-profile.json / synopsis.md / character-cards / 历史 score.json / 后续章节
 - [ ] 未读其他裁判的产出
 
 【返回评分 Agent】

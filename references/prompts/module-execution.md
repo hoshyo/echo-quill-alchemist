@@ -9,18 +9,22 @@
 
 【输入参数】
 - 当前 skill 主文件：<TARGET_SKILL>/SKILL.md（必读全文）
-- author-profile.json：<TARGET_SKILL>/references/author-profile.json（必读，关注 rolling_synopsis、句长目标、forbidden_words、characters）
-- references 子文件（按需读）：character-cards/、style-rules.md、world-bible.md
-- 前一章正文：<CWD>/alchemist-temp/source/chapter-<i-1>.md（必读全文）
-- 输出路径：<CWD>/alchemist-temp/attempts/chapter-<i>/attempt-<NN>/generated.md
+- author-profile.json：<TARGET_SKILL>/references/author-profile.json（必读，关注句长目标、forbidden_words、characters 索引；**注意：rolling_synopsis 字段已迁出**，故事概要去 synopsis.md 读）
+- synopsis.md：<TARGET_SKILL>/references/synopsis.md（**必读全文**，三段：主线骨架 / 近期细节 / 活跃伏笔；这是替代旧 rolling_synopsis 的关键"前文压缩"）
+- character-cards/<slug>.md：本章上一章涉及的人物 + activsynopsis 中"活跃人物"（**必读所涉及人物的卡**全文）
+- 按需读：style-rules.md、world-bible.md
+- 前一章正文：<CWD>/alchemist-temp/source/chapter-<NN3-1>.md（必读全文）
+- 输出路径：<CWD>/alchemist-temp/attempts/chapter-<NN3>/attempt-<NN2>/generated.md
 - 目标字数：<前一章字数> ±30% 内
 
 【你绝不读】
-- 真实本章正文 <CWD>/alchemist-temp/source/chapter-<i>.md（任何形式：Read / Glob / Grep / 找替代路径）
-- 后续章节 <CWD>/alchemist-temp/source/chapter-<j>.md（j > i）
+- 真实本章正文 <CWD>/alchemist-temp/source/chapter-<NN3>.md（任何形式：Read / Glob / Grep / 找替代路径）
+- 后续章节 <CWD>/alchemist-temp/source/chapter-<MM3>.md（MM > NN3）
 - 历史 attempts 目录下的任何 generated.md / score.json / report.md / commit-log.md（这些是别的尝试 / 别人的产出）
 - 训练日志 <CWD>/alchemist-temp/logs/*
-- progress.md / final-summary.md / lessons/
+- progress.md / final-summary.md / state.json / lessons/
+- snapshots/ 目录（章末快照，与你无关）
+- 早于上一章的 source/chapter-<MM3>.md（MM3 < NN3-1）—— 长程伏笔靠 synopsis.md 三段压缩传递，不读原文
 
 【输出要求】
 1. 字数与前一章相近（±30% 内）
@@ -36,17 +40,21 @@
 
 【生成时的思维过程（在脑海中走，不写到输出里）】
 1. 读前一章末尾 → 找钩子 / 未尽情绪 / 时间地点
-2. 读 rolling_synopsis → 看故事走向
+2. 读 synopsis.md 三段：
+   - 主线骨架 → 看故事大走向
+   - 近期细节 → 看最近 3 章发生了什么（替代读 chapter-<NN3-2>、chapter-<NN3-3> 原文）
+   - 活跃伏笔 → 列"本章可考虑兑现哪些伏笔"
 3. 读 SKILL.md 的"续写硬规则" → 列出本章必守清单
-4. 读涉及人物的 character-cards
+4. 读涉及人物的 character-cards/<slug>.md（覆盖前一章 + 活跃伏笔涉及的人物）
 5. 写第一段时承接前章末段（场景 / 情绪 / 时间线三选二必中）
-6. 中段推进：合理推进，不强行塞新设定（未在 world-bible 中的设定一律不引入）
+6. 中段推进：优先兑现"活跃伏笔"中的 1 条（如果合适），不强行塞新设定（未在 world-bible 中的设定一律不引入）
 7. 章末：抛钩子，留未尽
 
 【完成前自检】
-- [ ] 未读真实本章 chapter-<i>.md
+- [ ] 未读真实本章 chapter-<NN3>.md
 - [ ] 未读后续章节
-- [ ] 未读其它 attempt 目录
+- [ ] 未读其它 attempt 目录 / snapshots/ / state.json / lessons/
+- [ ] 已读 synopsis.md 三段（主线骨架 / 近期细节 / 活跃伏笔）
 - [ ] 输出文件已落盘到指定路径
 - [ ] 字数在前一章字数的 [70%, 130%] 区间
 - [ ] 第一行是章节标题且未引用训练相关字样
