@@ -25,14 +25,33 @@ self-upgrading; if you call pip directly, use `python -m pip install …` not `p
 
 Likely causes, check the backend log (`core/data/logs/backend.log`):
 
-- **MiniLM download stalled.** First-run downloads `all-MiniLM-L6-v2` (~90 MB). If the
-  download window has been open for >5 min and there's no progress, the user's HuggingFace
-  connection is the problem — kill the backend, ask them to check connectivity, retry.
+- **Model weight download stalled.** Server startup loads MiniLM (~90 MB), and
+  the first training chunk that emits a canon entity loads bge-m3 (~2.3 GB)
+  if it wasn't prefetched. If a download window has been open for >5 min with
+  no progress, the user's HuggingFace connection is the problem — kill the
+  backend, ask them to check connectivity, retry. To avoid hitting this in
+  the middle of a training run, run `prefetch_models.py` BEFORE start_services
+  (the standard workflow gate does this).
 - **Port 8000 already taken** by something else. `lsof -iTCP:8000 -sTCP:LISTEN` (mac/linux)
   or `Get-NetTCPConnection -LocalPort 8000` (Windows). Either kill the squatter or change
   `PORT=` in `.env` (and the dashboard's `VITE_WS_URL` to match — easier to free 8000).
 - **Missing API key** is *not* the cause here — the backend starts fine without one. The
   worker only fails when chunks arrive.
+
+## Doctor says `models_cached.ok = false`
+
+One or both HF model snapshots are not in the local cache yet. Fix:
+
+```
+python scripts/prefetch_models.py            # both
+python scripts/prefetch_models.py --minilm   # only MiniLM
+python scripts/prefetch_models.py --bge-m3   # only bge-m3
+```
+
+`doctor.py` does a filesystem probe via `huggingface_hub.try_to_load_from_cache`;
+it returns `false` if the user has a non-default `HF_HOME` / `TRANSFORMERS_CACHE`
+that we can't see, or if the cache was cleared. Running `prefetch_models.py`
+under the same shell as the backend should always make it green again.
 
 ## Worker logs `[FATAL] no Anthropic credentials …` (or `OPENAI_API_KEY not set`)
 
@@ -114,6 +133,7 @@ Never delete it without asking.
 Stop services (`stop_services.py`), then the user removes the directory. There are no
 installed services / system packages this skill registers. Heavy disk usage lives in:
 - `core/frontend/node_modules/` (~300 MB)
-- `~/.cache/huggingface/` (the MiniLM cache, ~100 MB)
+- `~/.cache/huggingface/` (MiniLM ~90 MB + bge-m3 ~2.3 GB, total ~2.4 GB) — shared
+  across other HF-based tools, don't blanket-delete without asking.
 - pip-installed `torch` in the user's site-packages (~2 GB) — **don't remove without
   asking**, other projects may share it.

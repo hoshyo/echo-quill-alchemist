@@ -248,9 +248,11 @@ Changing `.env` or switching CC Switch profile requires restarting the backend.
   startup.
 - **bge-m3 (`BAAI/bge-m3`, 1024-d, ~2.3 GB)** — `CanonEmbedder` (lazy singleton). Used
   for canon entity embedding at ingest time and dense canon retrieval at write time.
-  First-use download — happens on the **first new entity** of the first training run,
-  which means the first training does need it (a chunk with no new canon won't trigger
-  the load, but in practice chunk #1 always does).
+  The default install flow runs `scripts/prefetch_models.py` after `install_deps.py`,
+  so by the time the server starts both model snapshots are already in the local HF
+  cache. The lazy-load path inside `CanonEmbedder.model()` is therefore the *resilience*
+  path — it covers (a) someone who skipped the prefetch gate, and (b) a corrupted
+  cache that gets cleared between sessions — not the primary download trigger.
 
 The judge's α/β/threshold constants were tuned against MiniLM's distribution — do NOT swap
 its model without re-tuning. bge-m3 stays scoped to memory retrieval to keep the dual-tower

@@ -23,6 +23,14 @@ Optional knobs the user might mention:
    ├─ python/node/npm not ok      → tell the user, abort (we don't auto-install runtimes)
    ├─ backend_deps missing        → ASK to pip install (warn ~2GB / 5–15 min)
    │    on yes: install_deps.py --backend
+   ├─ models_cached not ok        → ASK to prefetch model weights (~2.4 GB total:
+   │                                MiniLM ~90 MB + bge-m3 ~2.3 GB).
+   │    on yes: prefetch_models.py
+   │    Do this BEFORE start_services so the server bootstrap and the first
+   │    canon-emitting chunk both hit a warm cache. Skipping it doesn't break
+   │    training — server lifespan will pull MiniLM on its own and bge-m3
+   │    will lazy-load on the first new entity — but the user will see what
+   │    looks like a mid-training stall. Always offer the prefetch.
    ├─ frontend_deps missing       → ASK to npm install
    │    on yes: install_deps.py --frontend
    ├─ env.source = "claude_code"  → CC Switch is active; SKIP ensure_env entirely.

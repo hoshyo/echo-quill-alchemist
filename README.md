@@ -72,7 +72,7 @@ Claude 会自检环境、提示一下大致 token 成本、打开仪表盘，然
 npx skills add hoshyo/echo-quill-alchemist
 ```
 
-之后跟 Claude 说话就行。第一次训练会触发依赖安装（torch + MiniLM ~2.1 GB，第一片有新角色出场时再拉 bge-m3 ~2.3 GB，共 ~4.5 GB）—— Claude 会先问你再装。后续训练 / 续写直接复用本地缓存。
+之后跟 Claude 说话就行。第一次训练前 Claude 会一次性问你是否要装依赖（pip 包 ~2 GB）以及拉两个本地模型（MiniLM + bge-m3，加起来 ~2.4 GB），都点头后才开始训练 —— 不会训练到一半再卡住下载。后续训练 / 续写直接复用本地缓存。
 
 需要一个能调通 Anthropic Messages API 或 OpenAI Chat Completions 的 endpoint。如果你在用 [CC Switch](https://github.com/farion1231/cc-switch) 管理 Claude Code 的 endpoint，Echo-Quill 会自动继承，**不用额外配 `.env`**。
 

@@ -1,10 +1,15 @@
 """bge-m3 wrapper for Canon / Plot retrieval and dedup.
 
 Lazy singleton: the model is *not* loaded at import time — first `encode()`
-call triggers the download (~2.3 GB on the first run on a clean machine) and
-keeps the model resident afterwards. This keeps server startup cheap when only
-training (which doesn't need bge-m3 yet, only retrieve does) and avoids
-forcing the user through the download until they actually need memory mode.
+call instantiates the SentenceTransformer, which loads from the local HF
+cache if available or downloads ~2.3 GB if not.
+
+In the default install flow `scripts/prefetch_models.py` runs after
+`install_deps.py --backend`, so by the time anything calls `encode()` the
+weights are already on disk and `model()` is a fast cache hit. The download
+branch inside `model()` is a resilience fallback for users who skipped the
+prefetch gate or whose HF cache was cleared between sessions — it should not
+be the routine path.
 
 Why a separate embedder from `DualTowerJudge`'s MiniLM
 ------------------------------------------------------

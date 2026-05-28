@@ -10,6 +10,7 @@ Output schema (stable):
   "npm":      {"ok": bool, "version": "11.4.2"},
   "backend_deps":  {"ok": bool, "missing": [...]},
   "frontend_deps": {"ok": bool, "node_modules": bool},
+  "models_cached": {"ok": bool, "minilm": bool, "bge_m3": bool},
   "env":      {"ok": bool, "provider": "anthropic"|"openai"|null, "has_key": bool},
   "services": {"backend": {"up": bool, "pid": int|null}, "frontend": {"up": bool, "pid": int|null}},
   "data":     {"dpo_pairs": int, "rules": int, "chunks_processed": int}
@@ -81,6 +82,35 @@ def _check_py_packages() -> tuple[bool, list[str]]:
     return (len(missing) == 0), missing
 
 
+def _check_models_cached() -> dict:
+    """Filesystem check against the local HF cache — does NOT import torch /
+    sentence-transformers, so it's safe to call before backend deps are
+    installed (returns ok=False with both models=False in that case).
+
+    huggingface_hub.try_to_load_from_cache returns a path string when the
+    requested file is in cache, or None / a sentinel otherwise. We probe
+    `config.json` because every transformer-based model snapshot carries one.
+    """
+    cached = {"minilm": False, "bge_m3": False}
+    try:
+        from huggingface_hub import try_to_load_from_cache
+    except ImportError:
+        return {"ok": False, "minilm": False, "bge_m3": False,
+                "note": "huggingface_hub not installed (run install_deps.py --backend first)"}
+
+    from pathlib import Path as _P
+    for label, repo_id in (
+        ("minilm", "sentence-transformers/all-MiniLM-L6-v2"),
+        ("bge_m3", "BAAI/bge-m3"),
+    ):
+        try:
+            path = try_to_load_from_cache(repo_id=repo_id, filename="config.json")
+            cached[label] = isinstance(path, str) and _P(path).exists()
+        except Exception:
+            cached[label] = False
+    return {"ok": all(cached.values()), **cached}
+
+
 def _check_env() -> dict:
     """Resolve LLM credentials the same way the backend does.
 
@@ -149,6 +179,7 @@ def main() -> None:
     npm_ok, npm_ver = _which_version("npm", ["--version"])
     pkgs_ok, pkgs_missing = _check_py_packages()
     fe_node_modules = (FRONTEND_DIR / "node_modules").exists()
+    models = _check_models_cached()
     env = _check_env()
     services = _service_status()
 
@@ -170,6 +201,7 @@ def main() -> None:
         "npm": {"ok": npm_ok, "version": npm_ver},
         "backend_deps": {"ok": pkgs_ok, "missing": pkgs_missing},
         "frontend_deps": {"ok": fe_node_modules, "node_modules": fe_node_modules},
+        "models_cached": models,
         "env": env,
         "services": services,
         "data": data,

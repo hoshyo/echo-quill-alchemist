@@ -36,7 +36,7 @@ output is the ground truth. Don't guess. Don't trust state from earlier turns.
 
 | User says (paraphrased)                                                  | What you do                                                                                                       |
 |--------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------|
-| "train on `<novel.txt>`" / "用这本书炼金"                                | doctor → ensure deps + creds → start_services → open_dashboard → `train.py --path <...>` (defaults to `--layer original`) |
+| "train on `<novel.txt>`" / "用这本书炼金"                                | doctor → ensure deps + models + creds → start_services → open_dashboard → `train.py --path <...>` (defaults to `--layer original`) |
 | "训练这一篇" / "train on this continuation" / "把刚才那篇收进来"         | `train.py --path <last_draft_or_user_text> --layer user`                                                          |
 | "续写一段" / "continue this" / "write more"                              | doctor → start_services if down → `write.py --context "..."` (memory mode)                                        |
 | "纯风格续写" / "无记忆续写" / "just the style, no canon"                 | `infer.py --context "..."` (legacy no-memory mode)                                                                |
@@ -67,9 +67,18 @@ caches refresh. Tell the user.
 
 ## Rules of engagement
 
-- **ASK before heavy installs.** Backend deps include MiniLM (~90 MB) at first
-  run + bge-m3 (~2.3 GB on first memory-mode call). Frontend `npm install`
-  takes ~30 s. Use AskUserQuestion. Never start silently.
+- **ASK before heavy installs.** Two distinct cost gates, both must be
+  confirmed before the first training run; after that they're idempotent
+  no-ops you can skip silently.
+  - **pip deps** (~2 GB, mostly torch + sentence-transformers) — gated on
+    `doctor.backend_deps.ok = false`. Runs `install_deps.py --backend`.
+  - **model weights** (~2.4 GB total: MiniLM ~90 MB + bge-m3 ~2.3 GB) —
+    gated on `doctor.models_cached.ok = false`. Runs `prefetch_models.py`.
+    Do this BEFORE `start_services.py`, so the server bootstrap and the
+    first canon-emitting chunk both hit a warm cache and never block a
+    user-facing flow on a download.
+  - **frontend npm install** (~30 s) — gated on `doctor.frontend_deps.ok = false`.
+  Use AskUserQuestion. Never start silently.
 - **ASK before spending API tokens.** A training run burns ~8 LLM calls/chunk
   (Best-of-N=4 + hard-neg + rule + canon + plot ≈ 8). On a 100-chunk novel
   that's ~800 calls. Memory-mode `write.py` is 1 LLM call/request. Confirm
@@ -100,6 +109,7 @@ caches refresh. Tell the user.
 | `doctor.py`         | JSON status — deps, env, services, data. Always run first.                               |
 | `detect_provider.py`| JSON: which credential source resolves right now.                                        |
 | `install_deps.py`   | `[--backend|--frontend]` — idempotent dep install.                                       |
+| `prefetch_models.py`| `[--minilm|--bge-m3]` — idempotent HF model weight download (MiniLM + bge-m3).            |
 | `ensure_env.py`     | Only call when `doctor.env.source = none`.                                               |
 | `start_services.py` | `[--backend|--frontend|--no-wait]`.                                                      |
 | `stop_services.py`  | `[--backend|--frontend]`.                                                                |
