@@ -17,6 +17,7 @@ import json
 import os
 import random
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Awaitable, Callable, List, Optional
 
 import httpx
@@ -32,6 +33,10 @@ from backend.models import (
     TrainingRequest,
     WSMessage,
 )
+
+# core/backend/engine.py → core/data — anchored, CWD-independent.
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+DPO_FILE = DATA_DIR / "dpo.jsonl"
 
 
 # ---------------------------------------------------------------------------
@@ -432,8 +437,7 @@ class EchoQuillAlchemist:
     def _persist_dpo(pairs: List[DPOPair]) -> None:
         if not pairs:
             return
-        os.makedirs("data", exist_ok=True)
-        path = os.path.join("data", "dpo.jsonl")
-        with open(path, "a", encoding="utf-8") as f:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with DPO_FILE.open("a", encoding="utf-8") as f:
             for p in pairs:
                 f.write(json.dumps(p.model_dump(mode="json"), ensure_ascii=False) + "\n")

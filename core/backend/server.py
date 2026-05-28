@@ -3,13 +3,14 @@
 Endpoints
 ---------
 POST /trigger_training  body={context, truth}    queues a chunk; returns immediately
+POST /infer             body={context, ...}      style-conditioned continuation (post-training use)
 GET  /state                                       full snapshot (debug / fallback)
 GET  /healthz                                     liveness + queue depth
 WS   /ws/alchemist                                push-only stream of WSMessage frames
 
 Run
 ---
-    python backend/server.py
+    python core/backend/server.py
 """
 from __future__ import annotations
 
@@ -17,17 +18,20 @@ import asyncio
 import os
 import sys
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import List, Optional
 
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
-# allow `python backend/server.py` (puts repo root on path)
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
+# core/backend/server.py → core/ → repo root
+CORE_DIR = Path(__file__).resolve().parent.parent
+REPO_ROOT = CORE_DIR.parent
+if str(CORE_DIR) not in sys.path:
+    sys.path.insert(0, str(CORE_DIR))
 
 from backend.engine import DualTowerJudge, EchoQuillAlchemist, LLMClient  # noqa: E402
 from backend.models import (  # noqa: E402
@@ -37,7 +41,9 @@ from backend.models import (  # noqa: E402
     WSMessage,
 )
 
-load_dotenv()
+# .env always lives at the repo root (skill level); load it explicitly so we're
+# CWD-independent when spawned by scripts/start_services.py.
+load_dotenv(REPO_ROOT / ".env")
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +131,7 @@ async def _worker() -> None:
 
 
 # ---------------------------------------------------------------------------
-# HTTP
+# HTTP — training intake
 # ---------------------------------------------------------------------------
 
 @app.post("/trigger_training", response_model=TrainingResponse)
@@ -139,6 +145,78 @@ async def trigger_training(req: TrainingRequest) -> TrainingResponse:
     )
 
 
+# ---------------------------------------------------------------------------
+# HTTP — post-training inference (style-conditioned generation)
+# ---------------------------------------------------------------------------
+
+class InferRequest(BaseModel):
+    context: str
+    top_rules: int = Field(default=5, ge=0, le=20)
+    few_shot: int = Field(default=2, ge=0, le=8)
+    max_tokens: int = Field(default=600, ge=64, le=4000)
+    temperature: float = Field(default=0.85, ge=0.0, le=1.5)
+
+
+class InferResponse(BaseModel):
+    continuation: str
+    rules_used: int
+    fewshot_used: int
+
+
+@app.post("/infer", response_model=InferResponse)
+async def infer(req: InferRequest) -> InferResponse:
+    """Style-conditioned continuation — uses learned rules + best DPO chosen examples
+    as a prompt-time RAG layer over the base LLM. Not a fine-tuned model; the DPO
+    pairs in data/dpo.jsonl are the artifact you'd hand to a downstream trainer.
+    """
+    assert ALCHEMIST is not None
+    if not req.context.strip():
+        raise HTTPException(status_code=400, detail="context is empty")
+
+    rules_sorted = sorted(
+        ALCHEMIST.state.rules,
+        key=lambda r: (r.hit_count, r.lifespan),
+        reverse=True,
+    )
+    top_rules = rules_sorted[: req.top_rules]
+    rule_block = "\n".join(f"- {r.description}" for r in top_rules) or "（无）"
+
+    dpo_sorted = sorted(
+        ALCHEMIST.state.dpo_pairs,
+        key=lambda p: p.chosen_score,
+        reverse=True,
+    )
+    fewshot = dpo_sorted[: req.few_shot]
+    if fewshot:
+        fewshot_block = "\n\n".join(
+            f"【示例上文】\n{p.prompt[-300:]}\n【示例续写】\n{p.chosen}" for p in fewshot
+        )
+    else:
+        fewshot_block = "（暂无示例）"
+
+    system = (
+        "你是续写引擎。请严格遵守以下从训练语料中习得的风格规则，"
+        "并仿照后续示例的语感续写新段落，只输出续写，不要解释、不要标题、不要 Markdown。\n\n"
+        f"【风格规则】\n{rule_block}\n\n"
+        f"【风格示例】\n{fewshot_block}"
+    )
+    text = await ALCHEMIST.llm.complete(
+        system=system,
+        user=f"【上文】\n{req.context}\n\n【续写】",
+        temperature=req.temperature,
+        max_tokens=req.max_tokens,
+    )
+    return InferResponse(
+        continuation=(text or "").strip(),
+        rules_used=len(top_rules),
+        fewshot_used=len(fewshot),
+    )
+
+
+# ---------------------------------------------------------------------------
+# HTTP — diagnostics
+# ---------------------------------------------------------------------------
+
 @app.get("/state", response_model=AlchemistState)
 async def get_state() -> AlchemistState:
     assert ALCHEMIST is not None
@@ -147,11 +225,19 @@ async def get_state() -> AlchemistState:
 
 @app.get("/healthz")
 async def healthz():
-    return {"ok": True, "queued": QUEUE.qsize() if QUEUE else 0}
+    assert ALCHEMIST is not None
+    return {
+        "ok": True,
+        "queued": QUEUE.qsize() if QUEUE else 0,
+        "chunks_processed": ALCHEMIST.state.chunks_processed,
+        "rules": len(ALCHEMIST.state.rules),
+        "dpo_pairs": len(ALCHEMIST.state.dpo_pairs),
+        "provider": ALCHEMIST.llm.provider,
+    }
 
 
 # ---------------------------------------------------------------------------
-# WebSocket (push-only — client→server msgs are ignored, kept open for ping/pong)
+# WebSocket
 # ---------------------------------------------------------------------------
 
 @app.websocket("/ws/alchemist")
