@@ -1,0 +1,13 @@
+/* Echo-Quill — global reset (App.css carries the dashboard theme). */
+
+* { box-sizing: border-box; }
+html, body, #root { margin: 0; padding: 0; height: 100%; }
+body {
+  background: #0b0d11;
+  color: #d8dee9;
+  font-family:
+    ui-sans-serif, system-ui, "Segoe UI", "PingFang SC",
+    "Microsoft YaHei", "Hiragino Sans", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+a { color: #5cd0ff; }
