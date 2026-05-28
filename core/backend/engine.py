@@ -278,6 +278,21 @@ class EchoQuillAlchemist:
 
     # ---------- main entry point ----------
     async def process_chunk(self, req: TrainingRequest) -> dict:
+        # PR-2: idempotency gate — bail BEFORE counter increment / token spend
+        # if this exact chunk_id was already committed in a prior session.
+        if req.chunk_id and req.novel_sha256:
+            from backend.persistence import seen_chunks
+            if seen_chunks.contains(req.novel_sha256, req.chunk_id):
+                await self._log(
+                    f"⊙ chunk {req.chunk_id} 已处理过，幂等跳过 "
+                    f"(chunks_processed={self.state.chunks_processed})"
+                )
+                return {
+                    "chunk_id": req.chunk_id,
+                    "skipped_duplicate": True,
+                    "dpo_emitted": 0,
+                }
+
         self.state.chunks_processed += 1
         idx = self.state.chunks_processed
         self.state.last_context_preview = req.context[-200:]
@@ -368,6 +383,17 @@ class EchoQuillAlchemist:
 
         # 5) Persist DPO pairs to disk
         self._persist_dpo(new_pairs)
+
+        # 6) Snapshot rules + chunk counter for crash recovery.
+        #    Must happen before chunk_done is broadcast so the dashboard's
+        #    reported progress is always ≤ what's been persisted.
+        self._persist_snapshot()
+
+        # 7) PR-2: commit chunk_id to seen-set + advance per-novel cursor.
+        #    Order matters: only after dpo + snapshot are durable do we mark
+        #    the chunk "done" — otherwise a crash here would orphan progress
+        #    ahead of state.
+        self._persist_chunk_meta(req)
 
         await self._phase("idle")
         await self._emit("chunk_done", {"chunk_index": idx, "dpo_emitted": len(new_pairs)})
@@ -469,3 +495,51 @@ class EchoQuillAlchemist:
         with DPO_FILE.open("a", encoding="utf-8") as f:
             for p in pairs:
                 f.write(json.dumps(p.model_dump(mode="json"), ensure_ascii=False) + "\n")
+
+    def _persist_snapshot(self) -> None:
+        """Save rules + chunks_processed for crash recovery. Never raises.
+
+        Failure here is logged but not propagated: the in-memory state remains
+        valid, the next chunk will retry, and DPO pairs are already on disk.
+        """
+        try:
+            from backend.persistence import snapshot
+            snapshot.save(self.state.rules, self.state.chunks_processed)
+        except Exception as e:
+            print(f"[snapshot] save failed: {e!r}")
+
+    def _persist_chunk_meta(self, req: TrainingRequest) -> None:
+        """Mark chunk_id as seen + advance the per-novel cursor. Never raises.
+
+        Quietly no-ops when the request lacks PR-2 metadata (manual callers).
+        Cursor advance requires the full set of slicing params; partial info
+        only updates the seen-set so idempotency still works.
+        """
+        if not (req.chunk_id and req.novel_sha256):
+            return
+        try:
+            from backend.persistence import seen_chunks
+            seen_chunks.add(req.novel_sha256, req.chunk_id)
+        except Exception as e:
+            print(f"[seen_chunks] add failed: {e!r}")
+
+        if (
+            req.novel_path is not None
+            and req.chunk_size is not None
+            and req.ctx_size is not None
+            and req.overlap is not None
+            and req.char_offset is not None
+        ):
+            try:
+                from backend.persistence import progress
+                progress.update(
+                    novel_sha256=req.novel_sha256,
+                    novel_path=req.novel_path,
+                    chunk_size=req.chunk_size,
+                    ctx=req.ctx_size,
+                    overlap=req.overlap,
+                    char_offset=req.char_offset,
+                    chunk_index=self.state.chunks_processed,
+                )
+            except Exception as e:
+                print(f"[progress] update failed: {e!r}")

@@ -17,6 +17,9 @@ venv/
 # Training artifacts (kept locally only)
 core/data/*.jsonl
 core/data/logs/
+core/data/snapshots/
+core/data/progress/
+core/data/seen/
 
 # Node / Vite
 core/frontend/node_modules/

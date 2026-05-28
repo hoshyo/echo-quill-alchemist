@@ -22,10 +22,14 @@ repo_root/
       models.py             ← Pydantic black-boxes
       engine.py             ← DualTowerJudge + LLMClient + Alchemist
       server.py             ← FastAPI + WebSocket
+      persistence/          ← crash-safe state IO (paths, atomic_io, snapshot)
     frontend/               ← Vite/React/Zustand dashboard
     scripts/feeder.py       ← internal feeder (called by scripts/train.py)
     data/
       dpo.jsonl             ← every DPO pair appended here
+      snapshots/state.json  ← rules + chunks_processed; rewritten each chunk
+      progress/<sha>.json   ← per-novel feed cursor (PR-2)
+      seen/<sha>.txt        ← per-novel chunk_id idempotency log (PR-2)
       logs/                 ← service stdout/stderr
   .env                      ← LLM keys (loaded by core/backend/server.py at startup)
   .echo-quill.state.json    ← runtime PIDs (managed by start_services / stop_services)
@@ -98,6 +102,70 @@ WebSocket frames (`backend/models.py::WSMessage`):
 | `chunk_done`  | `{"chunk_index": int, "dpo_emitted": int}`                        |
 
 When you change this list, update `frontend/src/store.ts` in the same commit.
+
+## Persistence
+
+Two independent disk artifacts, each with a different durability model:
+
+- `data/dpo.jsonl` — **append-only training log**. Authoritative for DPO pairs;
+  one line per `DPOPair`. The in-memory `state.dpo_pairs` is just a live cache
+  for `/infer`'s few-shot selector and is rebuilt from this file on each boot.
+- `data/snapshots/state.json` — **atomic full-rewrite** each chunk, holding
+  `rules` + `chunks_processed`. A `state.json.bak` is kept as a one-generation
+  safety net.
+
+The snapshot is written **after** `dpo.jsonl` is appended and **before**
+`chunk_done` is broadcast on the WebSocket — so the dashboard's reported
+progress is always ≤ what's been persisted.
+
+On startup, `server.py::lifespan` does two recoveries in order:
+1. `persistence.snapshot.load()` → restores rules + chunk counter
+2. `persistence.dpo_log.load_pairs()` → replays `dpo.jsonl` into `state.dpo_pairs`
+
+Transient fields (arena candidates, logs, current phase, previews) are
+deliberately not persisted.
+
+All persistence IO lives under `core/backend/persistence/` and is the only
+module that knows file paths or atomicity details — `engine.py` and
+`server.py` just call into it. Engine still owns the *append* to `dpo.jsonl`
+via its own constant for now; future PRs may consolidate.
+
+## Resumable training (PR-2)
+
+Two persistence files plus a deterministic chunk_id give the feeder /
+backend pair crash-safe, idempotent training.
+
+- **`data/progress/<sha>.json`** — per-novel cursor with the slicing params
+  (`chunk_size`, `ctx`, `overlap`) and the `next_char_offset` to resume from.
+  Atomically rewritten by the engine after each chunk completes.
+- **`data/seen/<sha>.txt`** — append-only log of every committed `chunk_id`,
+  loaded into an in-memory set on first access for O(1) lookup.
+
+Each chunk carries:
+
+```
+chunk_id = "<sha[:12]>:cs<chunk_size>:ctx<ctx>:ov<overlap>:off<char_offset>"
+```
+
+Embedding the slicing params in the id means changing any of them yields a
+fresh id-space — old progress doesn't accidentally apply to a newly re-sliced
+run.
+
+**Flow on `python scripts/train.py --path X.txt`:**
+
+1. Feeder hashes `X.txt` → `sha256`.
+2. Feeder GETs `/progress?novel_sha256=<sha>` and, if params match, jumps
+   `--start` forward to `next_char_offset`. Pass `--no-resume` to skip this.
+3. Feeder slides the window, tags each chunk with `chunk_id` + slicing
+   metadata, POSTs to `/trigger_training`.
+4. Engine's worker checks `seen_chunks.contains(...)` BEFORE incrementing
+   counters or spending tokens — duplicates are a silent no-op.
+5. After successful processing, the engine appends `chunk_id` to the seen
+   log and atomically advances the per-novel cursor.
+
+Order at chunk completion (matters for crash semantics):
+`dpo.jsonl append → state.json snapshot → seen log append → progress.json rewrite`.
+A crash anywhere leaves the cursor either correct or behind — never ahead.
 
 ## Inference (`/infer`)
 

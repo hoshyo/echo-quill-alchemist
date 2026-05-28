@@ -102,6 +102,29 @@ async def lifespan(app: FastAPI):
     judge = DualTowerJudge()
     llm = LLMClient()
     ALCHEMIST = EchoQuillAlchemist(judge=judge, llm=llm, broadcaster=manager.broadcast)
+
+    # Restore rules + chunk counter from previous session if a snapshot exists.
+    # DPO pairs live in dpo.jsonl (authoritative) and are replayed separately
+    # so /infer's few-shot pool isn't empty after a restart.
+    from backend.persistence import snapshot as _snapshot
+    from backend.persistence import dpo_log as _dpo_log
+    snap = _snapshot.load()
+    if snap is not None:
+        ALCHEMIST.state.rules = snap.rules
+        ALCHEMIST.state.chunks_processed = snap.chunks_processed
+        print(
+            f"[server] restored snapshot: {len(snap.rules)} rules, "
+            f"chunks_processed={snap.chunks_processed} "
+            f"(saved {snap.saved_at.isoformat()})"
+        )
+    else:
+        print("[server] no prior snapshot — starting fresh")
+
+    replayed = _dpo_log.load_pairs()
+    if replayed:
+        ALCHEMIST.state.dpo_pairs = replayed
+        print(f"[server] replayed {len(replayed)} DPO pairs from dpo.jsonl")
+
     QUEUE = asyncio.Queue()
     worker = asyncio.create_task(_worker())
     src = (llm.resolved.get("source") or "none") if hasattr(llm, "resolved") else "none"
@@ -236,6 +259,20 @@ async def infer(req: InferRequest) -> InferResponse:
 async def get_state() -> AlchemistState:
     assert ALCHEMIST is not None
     return ALCHEMIST.state
+
+
+@app.get("/progress")
+async def get_progress(novel_sha256: str):
+    """PR-2: feeder cursor lookup. Returns the last committed offset for this
+    novel so the feeder can auto-resume. Body shape:
+        { "found": false }                                       — never trained
+        { "found": true,  ...FeedProgress fields...  }           — has cursor
+    """
+    from backend.persistence import progress as _progress
+    p = _progress.load(novel_sha256)
+    if p is None:
+        return {"found": False}
+    return {"found": True, **p.model_dump(mode="json")}
 
 
 @app.get("/healthz")

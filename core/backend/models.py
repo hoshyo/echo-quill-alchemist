@@ -97,6 +97,16 @@ class TrainingRequest(BaseModel):
     context: str
     truth: str
 
+    # PR-2: idempotency + cursor metadata. All optional so manual /trigger_training
+    # callers (e.g. curl) still work. The feeder always populates them.
+    chunk_id: Optional[str] = None
+    novel_sha256: Optional[str] = None
+    novel_path: Optional[str] = None
+    chunk_size: Optional[int] = None
+    ctx_size: Optional[int] = None
+    overlap: Optional[int] = None
+    char_offset: Optional[int] = None
+
 
 class TrainingResponse(BaseModel):
     accepted: bool
