@@ -103,27 +103,20 @@ async def lifespan(app: FastAPI):
     llm = LLMClient()
     ALCHEMIST = EchoQuillAlchemist(judge=judge, llm=llm, broadcaster=manager.broadcast)
 
-    # Restore rules + chunk counter from previous session if a snapshot exists.
-    # DPO pairs live in dpo.jsonl (authoritative) and are replayed separately
-    # so /infer's few-shot pool isn't empty after a restart.
-    from backend.persistence import snapshot as _snapshot
-    from backend.persistence import dpo_log as _dpo_log
-    snap = _snapshot.load()
-    if snap is not None:
-        ALCHEMIST.state.rules = snap.rules
-        ALCHEMIST.state.chunks_processed = snap.chunks_processed
-        print(
-            f"[server] restored snapshot: {len(snap.rules)} rules, "
-            f"chunks_processed={snap.chunks_processed} "
-            f"(saved {snap.saved_at.isoformat()})"
-        )
+    # Restore the most-recently-modified corpus so /infer works after restart.
+    # If no corpus exists yet, we boot empty — engine will switch on first
+    # /trigger_training that carries a corpus_id.
+    from backend.persistence import paths as _paths
+    _paths.ensure_top_dirs()
+    most_recent = _paths.most_recent_corpus()
+    if most_recent is not None:
+        try:
+            ALCHEMIST.switch_corpus(most_recent)
+            print(f"[server] resumed corpus: {most_recent}")
+        except Exception as e:
+            print(f"[server] failed to resume {most_recent}: {e!r}")
     else:
-        print("[server] no prior snapshot — starting fresh")
-
-    replayed = _dpo_log.load_pairs()
-    if replayed:
-        ALCHEMIST.state.dpo_pairs = replayed
-        print(f"[server] replayed {len(replayed)} DPO pairs from dpo.jsonl")
+        print("[server] no corpus on disk — starting fresh")
 
     QUEUE = asyncio.Queue()
     worker = asyncio.create_task(_worker())
@@ -252,6 +245,97 @@ async def infer(req: InferRequest) -> InferResponse:
 
 
 # ---------------------------------------------------------------------------
+# HTTP — memory-mode continuation (PR-3.5)
+# ---------------------------------------------------------------------------
+
+class WriteRequest(BaseModel):
+    context: str
+    extra_instruction: Optional[str] = None  # natural-language "redo with X"
+    top_rules: int = Field(default=5, ge=0, le=20)
+    top_canon: int = Field(default=5, ge=0, le=20)
+    top_plot: int = Field(default=3, ge=0, le=20)
+    few_shot: int = Field(default=2, ge=0, le=8)
+    max_tokens: int = Field(default=1200, ge=64, le=4000)
+    temperature: float = Field(default=0.85, ge=0.0, le=1.5)
+    scope: Optional[List[str]] = None  # restrict to specific corpus_ids; None = all
+
+
+class WriteResponse(BaseModel):
+    continuation: str
+    rules_used: int
+    canon_used: int
+    plot_used: int
+    fewshot_used: int
+    draft_path: str
+    scope: List[str]
+
+
+@app.post("/write", response_model=WriteResponse)
+async def write_with_memory(req: WriteRequest) -> WriteResponse:
+    """Memory-mode continuation. Reads canon + plot + rules + DPO few-shot
+    UNION across all corpora on disk (or `scope`), assembles the 5-block
+    system prompt, generates a continuation, archives the draft.
+
+    Pure read on the memory side — no canon mutations. Training is a separate
+    explicit command (`train.py --layer user --path <draft>`).
+    """
+    assert ALCHEMIST is not None
+    if not req.context.strip():
+        raise HTTPException(status_code=400, detail="context is empty")
+
+    from backend.memory import retrieval as _retr
+    from backend.persistence import paths as _paths
+
+    scope = req.scope if req.scope is not None else _paths.list_corpora()
+    if not scope:
+        raise HTTPException(
+            status_code=400,
+            detail="no trained corpus on disk — run training first",
+        )
+
+    prompt = _retr.assemble_system_prompt(
+        context=req.context,
+        top_rules=req.top_rules,
+        top_canon=req.top_canon,
+        top_plot=req.top_plot,
+        few_shot=req.few_shot,
+        scope=scope,
+    )
+
+    user_msg = f"【上文】\n{req.context}\n\n"
+    if req.extra_instruction:
+        user_msg += f"【用户额外要求】\n{req.extra_instruction}\n\n"
+    user_msg += "【续写】"
+
+    text = await ALCHEMIST.llm.complete(
+        system=prompt["system"],
+        user=user_msg,
+        temperature=req.temperature,
+        max_tokens=req.max_tokens,
+    )
+    continuation = (text or "").strip()
+
+    # Archive — drafts are logged for traceability and so the user can later
+    # run `train.py --layer user --path <draft>` on a generation they liked.
+    from datetime import datetime, timezone
+    from backend.persistence.atomic_io import write_text_atomic
+    _paths.ensure_top_dirs()
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    draft_file = _paths.DRAFTS_DIR / f"{ts}.txt"
+    write_text_atomic(draft_file, continuation + "\n")
+
+    return WriteResponse(
+        continuation=continuation,
+        rules_used=prompt["rules_used"],
+        canon_used=prompt["canon_used"],
+        plot_used=prompt["plot_used"],
+        fewshot_used=prompt["fewshot_used"],
+        draft_path=str(draft_file),
+        scope=scope,
+    )
+
+
+# ---------------------------------------------------------------------------
 # HTTP — diagnostics
 # ---------------------------------------------------------------------------
 
@@ -262,17 +346,44 @@ async def get_state() -> AlchemistState:
 
 
 @app.get("/progress")
-async def get_progress(novel_sha256: str):
-    """PR-2: feeder cursor lookup. Returns the last committed offset for this
-    novel so the feeder can auto-resume. Body shape:
+async def get_progress(corpus_id: str):
+    """PR-3: feeder cursor lookup for a corpus. Body shape:
         { "found": false }                                       — never trained
         { "found": true,  ...FeedProgress fields...  }           — has cursor
     """
     from backend.persistence import progress as _progress
-    p = _progress.load(novel_sha256)
+    p = _progress.load(corpus_id)
     if p is None:
         return {"found": False}
     return {"found": True, **p.model_dump(mode="json")}
+
+
+@app.get("/corpora")
+async def list_corpora():
+    """List all corpora on disk with summary stats. Used by /infer, write.py,
+    rollback.py, dashboard."""
+    from backend.persistence import paths as _paths
+    from backend.persistence import dpo_log as _dpo
+    from backend.memory import canon as _canon
+    from backend.memory import plot as _plot
+    from backend.persistence import snapshot as _snap
+    out = []
+    for cid in _paths.list_corpora():
+        snap = _snap.load(cid)
+        canon_store = _canon.get(cid)
+        plot_store = _plot.get(cid)
+        out.append({
+            "corpus_id": cid,
+            "layer": cid.split("/", 1)[0],
+            "bundle": cid.split("/", 1)[1] if "/" in cid else "",
+            "rules": len(snap.rules) if snap else 0,
+            "chunks_processed": snap.chunks_processed if snap else 0,
+            "dpo_pairs": sum(1 for _ in _paths.corpus_dpo(cid).open("r", encoding="utf-8"))
+                if _paths.corpus_dpo(cid).exists() else 0,
+            "canon": len(canon_store.entities),
+            "plot": len(plot_store.events),
+        })
+    return {"corpora": out, "active": ALCHEMIST.current_corpus_id if ALCHEMIST else None}
 
 
 @app.get("/healthz")
@@ -281,9 +392,12 @@ async def healthz():
     return {
         "ok": True,
         "queued": QUEUE.qsize() if QUEUE else 0,
+        "corpus_id": ALCHEMIST.current_corpus_id,
         "chunks_processed": ALCHEMIST.state.chunks_processed,
         "rules": len(ALCHEMIST.state.rules),
         "dpo_pairs": len(ALCHEMIST.state.dpo_pairs),
+        "canon": ALCHEMIST.state.canon_count,
+        "plot": ALCHEMIST.state.plot_count,
         "provider": ALCHEMIST.llm.provider,
     }
 

@@ -15,8 +15,13 @@ venv/
 .pytest_cache/
 
 # Training artifacts (kept locally only)
-core/data/*.jsonl
+core/data/corpora/
+core/data/archive/
+core/data/drafts/
+core/data/embeddings/
 core/data/logs/
+# legacy paths from earlier PRs — keep ignored for cleanup safety
+core/data/*.jsonl
 core/data/snapshots/
 core/data/progress/
 core/data/seen/

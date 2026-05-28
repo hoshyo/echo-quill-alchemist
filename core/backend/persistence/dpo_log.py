@@ -1,16 +1,10 @@
-"""DPO training-log replay.
+"""DPO training-log replay — per-corpus.
 
-`engine.py::_persist_dpo` appends one JSON line per DPOPair to `dpo.jsonl`. That
-file is the authoritative store; the in-memory list `AlchemistState.dpo_pairs`
-is just a live cache used by `/infer`'s few-shot selector.
+Each corpus has its own append-only `dpo.jsonl`. On corpus switch (or server
+restart) `load_pairs(corpus_id)` rebuilds the in-memory list used by /infer's
+few-shot selector.
 
-On every backend boot we replay the log into the in-memory list so that
-`/infer`'s few-shot pool is non-empty after a restart. Pure recovery — no new
-behavior, no rewriting, no deduping (the log is append-only and trusted).
-
-Malformed lines (truncation, schema drift) are tolerated: they're skipped with
-a stderr note rather than aborting the boot. Returning a partial list is
-strictly better than refusing to start.
+Malformed lines are tolerated: skipped with a stderr note rather than aborting.
 """
 from __future__ import annotations
 
@@ -20,9 +14,9 @@ from backend.models import DPOPair
 from backend.persistence import paths
 
 
-def load_pairs() -> List[DPOPair]:
-    """Replay `dpo.jsonl` into a list of DPOPair. Returns [] if the file is absent."""
-    f = paths.DPO_FILE
+def load_pairs(corpus_id: str) -> List[DPOPair]:
+    """Replay `corpora/<id>/dpo.jsonl` into a list. Returns [] if absent."""
+    f = paths.corpus_dpo(corpus_id)
     if not f.exists():
         return []
 
@@ -37,8 +31,15 @@ def load_pairs() -> List[DPOPair]:
                 pairs.append(DPOPair.model_validate_json(line))
             except Exception as e:
                 skipped += 1
-                # Stay on stderr; the lifespan logger isn't available here.
-                print(f"[dpo_log] skipped {f.name}:{lineno} — {e!r}")
+                print(f"[dpo_log] skipped {f}:{lineno} — {e!r}")
     if skipped:
-        print(f"[dpo_log] replayed {len(pairs)} pairs, skipped {skipped} malformed")
+        print(f"[dpo_log] {corpus_id}: replayed {len(pairs)}, skipped {skipped} malformed")
     return pairs
+
+
+def append_pair(corpus_id: str, pair: DPOPair) -> None:
+    """Append a single DPO pair to this corpus's log."""
+    paths.ensure_corpus_dir(corpus_id)
+    f = paths.corpus_dpo(corpus_id)
+    with f.open("a", encoding="utf-8") as h:
+        h.write(pair.model_dump_json() + "\n")

@@ -1,20 +1,8 @@
-"""Per-novel feed cursor — where to resume from on the next training run.
+"""Per-corpus feed cursor — where to resume from on the next training run.
 
-Storage model
--------------
-One JSON file per novel: `data/progress/<novel_sha256>.json`. Atomic full-rewrite
-each chunk so a crashing backend never leaves a half-written cursor. The cursor
-records the **start char-offset** of the last successfully processed chunk, plus
-the chunking parameters that produced it. The next chunk's offset is also stored
-so the feeder doesn't need to re-derive the slide step.
-
-Resume semantics
-----------------
-The feeder GETs `/progress?novel_sha256=...` before slicing. If the response
-exists AND the chunking params (chunk_size / ctx / overlap) match the requested
-ones, the feeder jumps `args.start` forward to `next_char_offset`. Mismatched
-params mean a fundamentally different slicing — we refuse to silently resume
-and start from scratch instead.
+Storage: `corpora/<corpus_id>/progress.json`. Atomic full-rewrite each chunk.
+Resume semantics unchanged from PR-2: feeder GETs `/progress?corpus_id=...`,
+jumps `--start` forward to `next_char_offset` if slicing params match.
 """
 from __future__ import annotations
 
@@ -28,15 +16,13 @@ from backend.persistence.atomic_io import read_text_safe, write_text_atomic
 
 
 class FeedProgress(BaseModel):
-    """Persistent cursor for one novel's training feed."""
-
-    novel_sha256: str
+    corpus_id: str
+    novel_sha256: str = ""
     novel_path: str = ""
     chunk_size: int = 0
     ctx: int = 0
     overlap: int = 0
 
-    # char_offset is the start position of the truth window in the original file.
     last_committed_char_offset: int = 0
     next_char_offset: int = 0
     last_committed_chunk_index: int = 0
@@ -44,8 +30,8 @@ class FeedProgress(BaseModel):
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
-def load(novel_sha256: str) -> Optional[FeedProgress]:
-    text = read_text_safe(paths.progress_file(novel_sha256))
+def load(corpus_id: str) -> Optional[FeedProgress]:
+    text = read_text_safe(paths.corpus_progress(corpus_id))
     if text is None:
         return None
     try:
@@ -56,6 +42,7 @@ def load(novel_sha256: str) -> Optional[FeedProgress]:
 
 def update(
     *,
+    corpus_id: str,
     novel_sha256: str,
     novel_path: str,
     chunk_size: int,
@@ -64,10 +51,10 @@ def update(
     char_offset: int,
     chunk_index: int,
 ) -> None:
-    """Atomically advance the cursor after a chunk has been fully processed."""
-    paths.PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
+    paths.ensure_corpus_dir(corpus_id)
     step = max(1, chunk_size - overlap)
     p = FeedProgress(
+        corpus_id=corpus_id,
         novel_sha256=novel_sha256,
         novel_path=novel_path,
         chunk_size=chunk_size,
@@ -78,4 +65,4 @@ def update(
         last_committed_chunk_index=chunk_index,
         updated_at=datetime.now(timezone.utc),
     )
-    write_text_atomic(paths.progress_file(novel_sha256), p.model_dump_json(indent=2))
+    write_text_atomic(paths.corpus_progress(corpus_id), p.model_dump_json(indent=2))

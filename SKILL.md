@@ -1,120 +1,122 @@
 ---
 name: echo-quill-alchemist
-description: Train a model to imitate a novel's voice and use that voice on demand. Load this skill whenever the user asks to train/fine-tune/learn the style of a novel or .txt file, mentions Echo-Quill / Alchemist / 炼金 / 双塔, asks to open the training dashboard, asks how the system works, asks to stop or restart the training services, or asks to write/continue text in a previously-trained style. The skill manages a local FastAPI backend + Vite/React dashboard, dependency installation, .env scaffolding, training, and post-training inference — the user supplies a novel path or a passage, the skill handles everything underneath.
+description: Train a model on a novel, then continue writing in that novel's world — with memory of characters, places, and recent events. Load this skill whenever the user asks to train/fine-tune/learn the style of a novel or .txt, mentions Echo-Quill / Alchemist / 炼金 / 双塔, asks to open the training dashboard, asks how the system works, asks to stop or restart the training services, asks to write/continue text (with or without memory), asks to train an additional chapter or continuation they wrote, or asks to roll back to the original-novel state. The skill manages a local FastAPI backend + Vite/React dashboard, dependency installation, .env scaffolding, training, memory-mode continuation, pure-style continuation, and rollback — the user supplies a novel path or a passage, the skill handles everything underneath.
 ---
 
 # Echo-Quill Alchemist — skill router
 
-You are the natural-language entry point to the Echo-Quill Alchemist, a local system that
-turns novels into DPO training pairs and a dashboard, then serves style-conditioned generation
-post-training. The user does not understand the internals (dual-tower judge, ROUGE-L, DPO
-pairs, WebSocket) — they say "train on this novel" or "write something in last week's style".
-You translate that into the right scripts.
+You are the natural-language entry point to the Echo-Quill Alchemist. The user has
+two surface concepts:
 
-**The user's mental model is:** drop in a novel → see a dashboard → later, ask for writing in
-that style. Don't lecture them with internals unless they ask.
+1. **训练 (train)** — feed a `.txt` so the system learns the world (characters / places /
+   events) and the style. Each training run produces a **bundle** under
+   `core/data/corpora/{original,user}/<id>/`. Original-layer = the source novel.
+   User-layer = a continuation the user wrote (or generated) and asked you to train.
+2. **续写 (continue writing)** — two modes:
+   - **memory mode** (`write.py`): knows the canon (characters / world / recent
+     events) from all corpora. This is the default for any continuation request.
+   - **pure-style mode** (`infer.py`): style only, no memory. Use when the user
+     explicitly asks for "纯风格 / 无记忆" continuation.
+
+Rolling back = filesystem move of bundles into `archive/`. Reversible.
+
+The user does not understand internals (dual-tower, DPO, bge-m3, ROUGE-L).
+They say "train this novel" or "续写一段". Translate to scripts. Don't lecture.
 
 ---
 
 ## The single rule that comes before everything else
 
-**Always run `python scripts/doctor.py` first** for any echo-quill request. Its JSON output
-is the ground truth for every dispatch decision below. Don't guess. Don't trust state from
-earlier turns. Re-run the doctor.
+**Always run `python scripts/doctor.py` first** for any echo-quill request. Its JSON
+output is the ground truth. Don't guess. Don't trust state from earlier turns.
 
 ---
 
 ## Intent → action map
 
-| User says (paraphrased)                                                  | What you do                                                           |
-|--------------------------------------------------------------------------|-----------------------------------------------------------------------|
-| "train on `<novel.txt>`" / "用这本书炼金" / "feed `<path>` to echo-quill" | doctor → resolve missing deps (ASK first) → if `env.ok=false` resolve creds (see below) → start_services → open_dashboard → train.py --path `<...>` |
-| "show me the dashboard" / "open the observatory"                         | doctor → start_services (if down) → open_dashboard                    |
-| "how's training going?" / "status?"                                      | doctor + summarize backend `healthz` (chunks, rules, dpo_pairs)      |
-| "stop / shut it down / clean up"                                         | stop_services                                                         |
-| "write in the trained style" / "continue this in [novel]'s voice"        | doctor → start_services (if down) → infer.py --context "..."         |
-| "explain how this works"                                                 | read references/architecture.md and summarize for the user            |
-| "something broke / errors"                                                | doctor → read core/data/logs/{backend,frontend}.log → references/troubleshooting.md |
+| User says (paraphrased)                                                  | What you do                                                                                                       |
+|--------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------|
+| "train on `<novel.txt>`" / "用这本书炼金"                                | doctor → ensure deps + creds → start_services → open_dashboard → `train.py --path <...>` (defaults to `--layer original`) |
+| "训练这一篇" / "train on this continuation" / "把刚才那篇收进来"         | `train.py --path <last_draft_or_user_text> --layer user`                                                          |
+| "续写一段" / "continue this" / "write more"                              | doctor → start_services if down → `write.py --context "..."` (memory mode)                                        |
+| "纯风格续写" / "无记忆续写" / "just the style, no canon"                 | `infer.py --context "..."` (legacy no-memory mode)                                                                |
+| "重写 / 把 X 改成 Y / redo this" (right after a write)                   | `write.py --context "..." --redo "用户的修改要求"`                                                                |
+| "回滚 / 只保留原著 / 删掉我训练的那些续写"                                | `rollback.py --to original`                                                                                       |
+| "删掉刚训练的那篇 / 撤销那次 user 训练"                                   | `rollback.py --remove user/<id>` (run `rollback.py --list` first to find the id)                                 |
+| "把档案里的那篇恢复回来 / 撤销刚才的 rollback"                            | `rollback.py --restore <archive_id>`                                                                              |
+| "列一下训练过哪些 / show corpora"                                         | `rollback.py --list`  OR  `curl /corpora`                                                                         |
+| "show me the dashboard"                                                  | doctor → start_services (if down) → open_dashboard                                                                |
+| "how's training going?" / "status?"                                      | doctor + summarize backend `healthz`                                                                              |
+| "stop / shut it down"                                                    | stop_services                                                                                                     |
+| "explain how this works"                                                 | read `references/architecture.md` and summarize                                                                   |
+| "something broke / errors"                                                | doctor → tail `core/data/logs/{backend,frontend}.log` → `references/troubleshooting.md`                          |
 
-### Credential resolution (read this — it changes when you ASK)
+**After any rollback structural change, restart the backend** so its in-memory
+caches refresh. Tell the user.
 
-`doctor.py`'s `env` block is the source of truth. It carries a `source` field that says where
-Echo-Quill *would* pick up its API credentials right now:
+### Credential resolution
 
-| `env.source`    | What it means                                                | Your action                                  |
-|-----------------|--------------------------------------------------------------|----------------------------------------------|
-| `claude_code`   | Inherited from `~/.claude/settings.json` (CC Switch active)  | **DO NOT ASK.** Just proceed.                |
-| `shell_env`     | Found in this shell's environment (often = the same as above) | **DO NOT ASK.** Just proceed.                |
-| `.env`          | Project-local override is set                                 | **DO NOT ASK.** Just proceed.                |
-| `none`          | Nothing set anywhere                                          | ASK user — they can either activate a CC Switch profile, fill `.env` themselves, or hand you a key (then `ensure_env.py --provider X --key Y`). |
+`doctor.py`'s `env.source` says where credentials come from:
 
-If the user has CC Switch installed and a profile selected, the source will be `shell_env`
-or `claude_code` and you will not need an `.env`. Don't pester them. Don't suggest filling
-`.env` "for safety" — the resolver already covers them.
+| `env.source`    | Your action                                  |
+|-----------------|----------------------------------------------|
+| `claude_code` / `shell_env` / `.env` | **DO NOT ASK.** Proceed.       |
+| `none`          | ASK user — activate CC Switch profile, or hand you a key (then `ensure_env.py --provider X --key Y`). |
 
 ---
 
 ## Rules of engagement
 
-- **ASK before heavy installs.** `pip install sentence-transformers` pulls torch + MiniLM (~2 GB
-  on first run). `npm install` in `core/frontend/` takes ~30 s. Use AskUserQuestion. Never
-  silently start either when `doctor.py` reports them missing.
-- **ASK before spending API tokens.** A real training run burns ~5 LLM calls per chunk
-  (Best-of-N=4 + 1 hard-negative + 1 rule extraction = ~6). On a novel of 100 chunks that's
-  600+ calls. Confirm provider, model, and chunk count with the user before invoking
-  `train.py`. Mention which provider / base_url is active (read it from `doctor.py`'s `env`
-  block) — especially if it's a self-hosted relay, the user should know which budget is
-  being spent.
-- **ASK before writing `.env`.** Never paste an API key into the terminal log without
-  confirming. With CC Switch active you'll almost never need to write `.env` — only use
-  `ensure_env.py --provider X --key Y` if the user explicitly hands you a key and asks you
-  to lock the project to it.
-- **The backend reads credentials only at startup.** If `.env` changes, or the user switches
-  CC Switch profile, you must `stop_services.py --backend` then `start_services.py --backend`
-  for the change to take effect. Tell the user when and why.
-- **Background services persist between turns.** `.echo-quill.state.json` at repo root holds
-  PIDs. Always check `doctor.py` before spawning anything — never start a second backend.
-- **Translate technical errors.** When a script returns a stack trace or a non-zero exit,
-  render the user-facing reason: "API key invalid", "novel file not found", "port 8000 already
-  in use", "backend log shows MiniLM download timed out". Don't dump tracebacks unless the
-  user asks for "the full error".
-- **Keep the user in the loop while training.** After `train.py` starts, the dashboard streams
-  progress visually — direct the user there. Don't tail logs and recite chunks.
-- **One job at a time.** Don't kick off `train.py` while another novel is being trained
-  (check backend `healthz.queued`). Ask the user whether to wait or cancel first.
+- **ASK before heavy installs.** Backend deps include MiniLM (~90 MB) at first
+  run + bge-m3 (~2.3 GB on first memory-mode call). Frontend `npm install`
+  takes ~30 s. Use AskUserQuestion. Never start silently.
+- **ASK before spending API tokens.** A training run burns ~8 LLM calls/chunk
+  (Best-of-N=4 + hard-neg + rule + canon + plot ≈ 8). On a 100-chunk novel
+  that's ~800 calls. Memory-mode `write.py` is 1 LLM call/request. Confirm
+  provider + model + scope before any large training run. Read provider
+  from `doctor.py`'s `env` block — flag self-hosted relays.
+- **The backend reads credentials only at startup.** If `.env` changes or the
+  user switches CC Switch profile: `stop_services.py --backend` then
+  `start_services.py --backend`.
+- **Background services persist between turns.** `.echo-quill.state.json` at
+  repo root holds PIDs. Always check `doctor.py` before spawning anything.
+- **One training job at a time.** Don't kick off a second `train.py` while
+  `healthz.queued > 0` or active. Ask the user to wait or cancel.
+- **Translate technical errors.** Render the user-facing reason ("API key
+  invalid", "novel not found", "port 8000 busy", "bge-m3 download stuck").
+  Don't dump tracebacks unless explicitly asked.
+- **Memory mode is the default for continuation.** Only fall back to
+  `infer.py` if the user explicitly says "no memory" / "纯风格" / "ignore
+  what was learned about characters".
+- **Drafts are auto-archived to `core/data/drafts/<ts>.txt`.** When the user
+  says "train that last continuation", use that path.
 
 ---
 
-## Available scripts (call them; don't reimplement)
+## Available scripts
 
-All scripts live at `scripts/` and are invoked with `python scripts/<name>.py`. Most accept
-`--help`. They output JSON (or plain text for `infer.py`) for easy consumption.
+| Script              | Purpose                                                                                  |
+|---------------------|------------------------------------------------------------------------------------------|
+| `doctor.py`         | JSON status — deps, env, services, data. Always run first.                               |
+| `detect_provider.py`| JSON: which credential source resolves right now.                                        |
+| `install_deps.py`   | `[--backend|--frontend]` — idempotent dep install.                                       |
+| `ensure_env.py`     | Only call when `doctor.env.source = none`.                                               |
+| `start_services.py` | `[--backend|--frontend|--no-wait]`.                                                      |
+| `stop_services.py`  | `[--backend|--frontend]`.                                                                |
+| `open_dashboard.py` | Open `http://localhost:5173`.                                                            |
+| `train.py`          | `--path X.txt [--layer original|user --chunk_size N --ctx N --limit N --no-resume]`     |
+| `write.py`          | `--context "..." [--redo "..." --top_canon N --top_plot N --scope CORPUS,CORPUS]` — **memory mode** |
+| `infer.py`          | `--context "..." [--top_rules N --few_shot N]` — **pure-style no-memory mode**           |
+| `rollback.py`       | `--list | --to original | --remove CORPUS_ID | --restore ARCHIVE_ID | --wipe-all --yes` |
 
-| Script              | Purpose                                                            |
-|---------------------|--------------------------------------------------------------------|
-| `doctor.py`         | JSON status — deps, env, services, data. Always run first.         |
-| `detect_provider.py`| JSON: which credential source resolves right now (CC Switch / .env / shell_env / none). |
-| `install_deps.py`   | `[--backend|--frontend]` — idempotent dep install. Heavy on first run. |
-| `ensure_env.py`     | Only call this when `doctor.env.source = none`. Validate or write `.env`. |
-| `start_services.py` | `[--backend|--frontend|--no-wait]` — spawn detached, write state.  |
-| `stop_services.py`  | `[--backend|--frontend]` — kill via state PIDs, fallback to ports. |
-| `open_dashboard.py` | Open browser to `http://localhost:5173`.                           |
-| `train.py`          | `--path X.txt [--chunk_size N --ctx N --limit N]` — feed novel.    |
-| `infer.py`          | `--context "..." [--top_rules N --few_shot N]` — generate style.   |
-
-Internal script (do NOT call from skill — `train.py` wraps it): `core/scripts/feeder.py`.
+Internal (do NOT call directly): `core/scripts/feeder.py` — wrapped by `train.py`.
 
 ---
 
 ## When to load reference docs
 
-Only pull these into context when the user's request actually needs them.
-
-- `references/architecture.md` — when the user asks how the system works (dual-tower, DPO,
-  rule lifecycle), or when you yourself need to reason about a non-obvious behavior.
-- `references/workflow-train.md` — before starting a real training run, especially the first
-  one for a given user/novel.
-- `references/workflow-infer.md` — before calling `infer.py`, or when explaining how the
-  "use the trained style" flow works.
-- `references/troubleshooting.md` — when `doctor.py` shows a problem or a script returned
-  non-zero.
+- `references/architecture.md` — when the user asks how it works, or you need
+  to reason about non-obvious behavior (dual-tower, corpus layering, retrieval).
+- `references/workflow-train.md` — before starting a real training run.
+- `references/workflow-infer.md` — for continuation flows (memory + pure-style).
+- `references/troubleshooting.md` — when `doctor.py` shows a problem.

@@ -1,22 +1,10 @@
-"""Per-novel chunk_id idempotency log.
+"""Per-corpus chunk_id idempotency log.
 
-Why this exists
----------------
-A feeder restart races against a backend restart: the feeder may resend chunks
-that the backend already processed (because the feeder doesn't know exactly
-how far the backend got, or because the user manually re-ran train.py). The
-fix is to make `/trigger_training` idempotent — if `chunk_id` was already
-processed, the engine bails before incrementing counters or spending tokens.
+Storage: `corpora/<corpus_id>/seen.txt`, one chunk_id per line, append-only.
+Loaded into an in-memory `set[str]` on first access for O(1) `contains()`.
 
-Storage model
--------------
-One append-only text file per novel: `data/seen/<novel_sha256>.txt`, one
-chunk_id per line. On first access for a given novel, the file is loaded into
-an in-memory `set[str]` for O(1) `contains()`. New chunk_ids are written
-through to disk on every `add()` so the guarantee holds across crashes.
-
-The set is bounded by the number of chunks in the novel — a 1000-chunk novel
-yields ~30 KB on disk and a 1000-element set in memory. Negligible.
+Cache key is `corpus_id` (not novel_sha256), so each bundle has its own
+idempotency space — the same chunk_id from different bundles won't collide.
 """
 from __future__ import annotations
 
@@ -27,13 +15,12 @@ from backend.persistence import paths
 _caches: Dict[str, Set[str]] = {}
 
 
-def _load(novel_sha256: str) -> Set[str]:
-    """Load (or return cached) chunk_id set for this novel."""
-    cached = _caches.get(novel_sha256)
+def _load(corpus_id: str) -> Set[str]:
+    cached = _caches.get(corpus_id)
     if cached is not None:
         return cached
     s: Set[str] = set()
-    f = paths.seen_file(novel_sha256)
+    f = paths.corpus_seen(corpus_id)
     if f.exists():
         try:
             for line in f.read_text(encoding="utf-8").splitlines():
@@ -42,21 +29,25 @@ def _load(novel_sha256: str) -> Set[str]:
                     s.add(line)
         except OSError:
             pass
-    _caches[novel_sha256] = s
+    _caches[corpus_id] = s
     return s
 
 
-def contains(novel_sha256: str, chunk_id: str) -> bool:
-    return chunk_id in _load(novel_sha256)
+def contains(corpus_id: str, chunk_id: str) -> bool:
+    return chunk_id in _load(corpus_id)
 
 
-def add(novel_sha256: str, chunk_id: str) -> None:
-    """Append `chunk_id` to the seen set + log file. Idempotent."""
-    s = _load(novel_sha256)
+def add(corpus_id: str, chunk_id: str) -> None:
+    s = _load(corpus_id)
     if chunk_id in s:
         return
     s.add(chunk_id)
-    paths.SEEN_DIR.mkdir(parents=True, exist_ok=True)
-    f = paths.seen_file(novel_sha256)
+    paths.ensure_corpus_dir(corpus_id)
+    f = paths.corpus_seen(corpus_id)
     with f.open("a", encoding="utf-8") as h:
         h.write(chunk_id + "\n")
+
+
+def drop_cache(corpus_id: str) -> None:
+    """Forget the in-memory set for `corpus_id`. Used by rollback / archive."""
+    _caches.pop(corpus_id, None)

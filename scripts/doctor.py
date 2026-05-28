@@ -27,11 +27,12 @@ import urllib.request
 from _paths import (
     BACKEND_URL,
     CORE_DIR,
-    DPO_FILE,
     ENV_FILE,
     FRONTEND_DIR,
     FRONTEND_URL,
     STATE_FILE,
+    count_dpo_pairs_on_disk,
+    list_corpora,
 )
 
 # pull the same resolver the backend uses so the JSON we emit and the env the
@@ -151,15 +152,16 @@ def main() -> None:
     env = _check_env()
     services = _service_status()
 
-    dpo_count = 0
-    if DPO_FILE.exists():
-        with DPO_FILE.open("r", encoding="utf-8") as f:
-            dpo_count = sum(1 for _ in f)
+    dpo_count = count_dpo_pairs_on_disk()
+    corpora = list_corpora()
 
     data = {
         "dpo_pairs_on_disk": dpo_count,
+        "corpora": corpora,
+        "corpora_count": len(corpora),
         "rules": (services["backend"].get("healthz") or {}).get("rules", 0),
         "chunks_processed": (services["backend"].get("healthz") or {}).get("chunks_processed", 0),
+        "active_corpus": (services["backend"].get("healthz") or {}).get("corpus_id"),
     }
 
     report = {

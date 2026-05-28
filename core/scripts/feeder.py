@@ -1,28 +1,20 @@
 """Echo-Quill Alchemist feeder.
 
-Reads a novel `.txt`, slides a window over it, and feeds successive
-(context, truth) pairs into the running backend at /trigger_training.
+Reads a source `.txt`, slides a window over it, and feeds successive
+(context, truth) pairs into the running backend at /trigger_training, tagged
+with the corpus_id allocated by scripts/train.py.
 
-Each chunk:
-  - context = preceding `--ctx` characters
-  - truth   = the next `--chunk_size` characters
-
-Resume semantics (PR-2)
+Resume semantics (PR-3)
 -----------------------
-On startup the feeder hashes the novel (sha256), GETs `/progress?novel_sha256=...`,
-and if the backend already has a cursor with matching slicing parameters it
-auto-jumps to the next un-processed chunk. The feeder also tags every chunk
-with a deterministic `chunk_id` so the backend can short-circuit duplicates
-even if the feeder forgets — belt-and-braces.
+On startup the feeder GETs `/progress?corpus_id=...`. If a cursor exists with
+matching slicing parameters, it jumps `--start` forward to `next_char_offset`.
+Pass `--no-resume` to start fresh.
 
-By default the feeder waits for the backend queue to drain below `--max_queue`
-before sending the next chunk. To go full throttle: `--max_queue 999`.
-Pass `--no-resume` to ignore any saved cursor and start fresh.
+Idempotency: each chunk carries a deterministic `chunk_id` so the backend
+short-circuits duplicates inside the worker.
 
-Usage:
-  python scripts/feeder.py --path my_novel.txt
-  python scripts/feeder.py --path my_novel.txt --chunk_size 600 --ctx 1200 --gap 0.5
-  python scripts/feeder.py --path my_novel.txt --no-resume
+Usage (normally invoked by scripts/train.py — direct use is for advanced):
+  python core/scripts/feeder.py --path X.txt --corpus_id original/abc123def456
 """
 from __future__ import annotations
 
@@ -86,19 +78,15 @@ def slide(
 def resolve_resume_offset(
     cli: httpx.Client,
     url: str,
-    novel_sha256: str,
+    corpus_id: str,
     chunk_size: int,
     ctx_size: int,
     overlap: int,
     user_start: int,
 ) -> int:
-    """Look up the per-novel cursor and return the resolved start offset.
-
-    Returns user_start if no progress is found, params don't match, or the
-    saved next_char_offset is behind user_start. Never returns < user_start.
-    """
+    """Look up the per-corpus cursor and return the resolved start offset."""
     try:
-        r = cli.get(f"{url}/progress", params={"novel_sha256": novel_sha256}, timeout=5.0)
+        r = cli.get(f"{url}/progress", params={"corpus_id": corpus_id}, timeout=5.0)
         r.raise_for_status()
         data = r.json()
     except Exception as e:
@@ -106,7 +94,7 @@ def resolve_resume_offset(
         return user_start
 
     if not data.get("found"):
-        print(f"[feeder] no prior progress for this novel; starting at --start={user_start}")
+        print(f"[feeder] no prior progress for {corpus_id}; starting at --start={user_start}")
         return user_start
 
     same = (
@@ -136,17 +124,19 @@ def resolve_resume_offset(
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--path", required=True, help="path to novel .txt (utf-8)")
+    ap.add_argument("--path", required=True, help="path to source .txt (utf-8)")
+    ap.add_argument("--corpus_id", required=True,
+                    help='corpus bundle id, e.g. "original/abc123def456" or "user/20260528_x7k2"')
     ap.add_argument("--chunk_size", type=int, default=500, help="chars per truth chunk")
     ap.add_argument("--ctx", type=int, default=800, help="chars of preceding context")
     ap.add_argument("--overlap", type=int, default=0, help="overlap between successive chunks")
     ap.add_argument("--gap", type=float, default=0.5, help="hard sleep after each send (s)")
     ap.add_argument("--max_queue", type=int, default=1, help="back-pressure: wait until backend queue<this")
-    ap.add_argument("--start", type=int, default=0, help="skip first N chars of the novel")
+    ap.add_argument("--start", type=int, default=0, help="skip first N chars of the source")
     ap.add_argument("--limit", type=int, default=0, help="max chunks to send (0 = all)")
     ap.add_argument("--url", default="http://localhost:8000")
     ap.add_argument("--no-resume", action="store_true",
-                    help="ignore any saved cursor for this novel and start at --start")
+                    help="ignore any saved cursor for this corpus")
     args = ap.parse_args()
 
     p = Path(args.path)
@@ -155,7 +145,8 @@ def main() -> None:
         sys.exit(2)
 
     sha = file_sha256(p)
-    print(f"[feeder] novel sha256[:12] = {sha[:12]}  ({p.name}, {p.stat().st_size:,} bytes)")
+    print(f"[feeder] corpus={args.corpus_id}  sha256[:12]={sha[:12]}  "
+          f"({p.name}, {p.stat().st_size:,} bytes)")
 
     sent = 0
     with httpx.Client(timeout=30.0) as cli:
@@ -172,7 +163,7 @@ def main() -> None:
         start_offset = args.start
         if not args.no_resume:
             start_offset = resolve_resume_offset(
-                cli, args.url, sha, args.chunk_size, args.ctx, args.overlap, args.start
+                cli, args.url, args.corpus_id, args.chunk_size, args.ctx, args.overlap, args.start
             )
 
         raw = p.read_text(encoding="utf-8", errors="ignore")
@@ -181,9 +172,6 @@ def main() -> None:
             print(f"[feeder] start_offset ({start_offset}) >= file length ({total}); nothing to do.")
             return
 
-        # Iterate the full slide and skip past `start_offset` rather than
-        # slicing `raw` — this avoids losing the chunk at exactly `start_offset`
-        # when ctx_size and step don't align nicely (e.g. chunk_size=500 ctx=800).
         print(f"[feeder] feeding from offset {start_offset:,} / {total:,} "
               f"({total - start_offset:,} chars remaining)")
 
@@ -209,6 +197,8 @@ def main() -> None:
             payload = {
                 "context": ctx,
                 "truth": truth,
+                "corpus_id": args.corpus_id,
+                "layer": args.corpus_id.split("/", 1)[0] if "/" in args.corpus_id else None,
                 "chunk_id": chunk_id,
                 "novel_sha256": sha,
                 "novel_path": str(p.resolve()),
@@ -224,9 +214,6 @@ def main() -> None:
             except Exception as e:
                 print(f"[feeder] ! send failed: {e}", file=sys.stderr)
             else:
-                # POST already succeeded — count it before the (possibly
-                # encoding-fragile) preview print, so a Windows GBK terminal
-                # choking on ▸ in truth can't fake a send failure.
                 sent += 1
                 try:
                     head = truth[:24].replace("\n", " ")

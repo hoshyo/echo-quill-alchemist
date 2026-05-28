@@ -17,7 +17,6 @@ import json
 import os
 import random
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Awaitable, Callable, List, Optional
 
 import httpx
@@ -33,10 +32,6 @@ from backend.models import (
     TrainingRequest,
     WSMessage,
 )
-
-# core/backend/engine.py → core/data — anchored, CWD-independent.
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
-DPO_FILE = DATA_DIR / "dpo.jsonl"
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +255,56 @@ class EchoQuillAlchemist:
         self.dpo_margin_threshold = dpo_margin_threshold
         self.rule_match_threshold = rule_match_threshold
         self.state = AlchemistState()
+        self.current_corpus_id: Optional[str] = None
+
+    # ---------- corpus state management ----------
+    def switch_corpus(self, corpus_id: str) -> None:
+        """Switch the engine's active state to a different corpus.
+
+        Flushes the outgoing corpus's snapshot, then loads the incoming
+        corpus's rules / chunks_processed / dpo pairs from disk. Safe to
+        call multiple times — no-op if already on the target corpus.
+
+        Synchronous on purpose: state correctness is more important than
+        worker latency, and disk IO here is sub-millisecond.
+        """
+        if corpus_id == self.current_corpus_id:
+            return
+
+        # Flush outgoing (best-effort)
+        if self.current_corpus_id is not None:
+            try:
+                from backend.persistence import snapshot as _snap
+                _snap.save(self.current_corpus_id, self.state.rules, self.state.chunks_processed)
+            except Exception as e:
+                print(f"[engine] flush snapshot for {self.current_corpus_id} failed: {e!r}")
+
+        # Load incoming
+        from backend.persistence import snapshot as _snap
+        from backend.persistence import dpo_log as _dpo
+        snap = _snap.load(corpus_id)
+        pairs = _dpo.load_pairs(corpus_id)
+
+        from backend.memory import canon as _canon
+        from backend.memory import plot as _plot
+        canon_store = _canon.get(corpus_id)
+        plot_store = _plot.get(corpus_id)
+
+        self.state = AlchemistState(
+            corpus_id=corpus_id,
+            rules=(snap.rules if snap else []),
+            chunks_processed=(snap.chunks_processed if snap else 0),
+            dpo_pairs=pairs,
+            canon_count=len(canon_store.entities),
+            plot_count=len(plot_store.events),
+        )
+        self.current_corpus_id = corpus_id
+        print(
+            f"[engine] corpus → {corpus_id} "
+            f"(rules={len(self.state.rules)}, chunks={self.state.chunks_processed}, "
+            f"dpo={len(self.state.dpo_pairs)}, canon={self.state.canon_count}, "
+            f"plot={self.state.plot_count})"
+        )
 
     # ---------- broadcasting helpers ----------
     async def _emit(self, type_: str, payload) -> None:
@@ -278,16 +323,26 @@ class EchoQuillAlchemist:
 
     # ---------- main entry point ----------
     async def process_chunk(self, req: TrainingRequest) -> dict:
+        # PR-3: corpus binding. Required.
+        if not req.corpus_id:
+            await self._log("× chunk 缺少 corpus_id，拒绝处理")
+            return {"skipped": True, "reason": "no_corpus_id"}
+
+        prev_corpus = self.current_corpus_id
+        self.switch_corpus(req.corpus_id)
+        if prev_corpus != req.corpus_id:
+            await self._emit("corpus_switch", {"corpus_id": req.corpus_id})
+
         # PR-2: idempotency gate — bail BEFORE counter increment / token spend
-        # if this exact chunk_id was already committed in a prior session.
-        if req.chunk_id and req.novel_sha256:
+        if req.chunk_id:
             from backend.persistence import seen_chunks
-            if seen_chunks.contains(req.novel_sha256, req.chunk_id):
+            if seen_chunks.contains(req.corpus_id, req.chunk_id):
                 await self._log(
                     f"⊙ chunk {req.chunk_id} 已处理过，幂等跳过 "
                     f"(chunks_processed={self.state.chunks_processed})"
                 )
                 return {
+                    "corpus_id": req.corpus_id,
                     "chunk_id": req.chunk_id,
                     "skipped_duplicate": True,
                     "dpo_emitted": 0,
@@ -298,10 +353,14 @@ class EchoQuillAlchemist:
         self.state.last_context_preview = req.context[-200:]
         self.state.last_truth_preview = req.truth[:200]
 
-        await self._log(f"=== chunk #{idx} 入炉 (truth {len(req.truth)}字 / ctx {len(req.context)}字) ===")
+        await self._log(
+            f"=== chunk #{idx} 入炉 (truth {len(req.truth)}字 / ctx {len(req.context)}字) "
+            f"[corpus={req.corpus_id}] ==="
+        )
         await self._emit("chunk_start", {
             "chunk_index": idx,
             "context_preview": self.state.last_context_preview,
+            "corpus_id": req.corpus_id,
         })
 
         # 1) Best-of-N + Hard Negative — fully parallel
@@ -311,7 +370,6 @@ class EchoQuillAlchemist:
         hardneg_task = asyncio.create_task(self._gen_hard_negative(req.context))
         normal_texts, hard_neg_text = await asyncio.gather(normal_task, hardneg_task)
 
-        # filter empty
         normal_texts = [t for t in normal_texts if t.strip()]
         if not normal_texts:
             await self._log("× 全部常规候选生成失败，跳过本 chunk。")
@@ -343,7 +401,7 @@ class EchoQuillAlchemist:
                 f"  困难负   sem={hard_neg.semantic_score:.3f}  rouge={hard_neg.rouge_score:.3f}  ∑={hard_neg.composite_score:.3f}"
             )
 
-        # 3) DPO 相变 — guaranteed best_vs_hard_neg + optional best_vs_worst_normal
+        # 3) DPO 相变
         await self._phase("dpo")
         best = candidates[0]
         worst = candidates[-1]
@@ -381,24 +439,27 @@ class EchoQuillAlchemist:
         await self._phase("rules")
         await self._update_rules(req.truth)
 
-        # 5) Persist DPO pairs to disk
-        self._persist_dpo(new_pairs)
+        # 5) Canon extraction (PR-3)
+        await self._phase("canon")
+        await self._update_canon(req.truth, req.corpus_id, idx)
 
-        # 6) Snapshot rules + chunk counter for crash recovery.
-        #    Must happen before chunk_done is broadcast so the dashboard's
-        #    reported progress is always ≤ what's been persisted.
+        # 6) Plot extraction (PR-3)
+        await self._phase("plot")
+        await self._update_plot(req.truth, req.corpus_id, idx)
+
+        # 7) Persist DPO pairs to disk (per-corpus)
+        self._persist_dpo(req.corpus_id, new_pairs)
+
+        # 8) Snapshot rules + chunk counter for crash recovery.
         self._persist_snapshot()
 
-        # 7) PR-2: commit chunk_id to seen-set + advance per-novel cursor.
-        #    Order matters: only after dpo + snapshot are durable do we mark
-        #    the chunk "done" — otherwise a crash here would orphan progress
-        #    ahead of state.
+        # 9) Commit chunk_id to seen-set + advance per-corpus cursor.
         self._persist_chunk_meta(req)
 
         await self._phase("idle")
         await self._emit("chunk_done", {"chunk_index": idx, "dpo_emitted": len(new_pairs)})
         await self._log(f"=== chunk #{idx} 出炉 — 新增 DPO 对 {len(new_pairs)} 条 ===")
-        return {"chunk_index": idx, "dpo_emitted": len(new_pairs)}
+        return {"chunk_index": idx, "dpo_emitted": len(new_pairs), "corpus_id": req.corpus_id}
 
     # ---------- generation ----------
     async def _gen_normal(self, context: str) -> str:
@@ -486,45 +547,119 @@ class EchoQuillAlchemist:
         except Exception:
             return []
 
-    # ---------- persistence ----------
-    @staticmethod
-    def _persist_dpo(pairs: List[DPOPair]) -> None:
-        if not pairs:
-            return
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        with DPO_FILE.open("a", encoding="utf-8") as f:
-            for p in pairs:
-                f.write(json.dumps(p.model_dump(mode="json"), ensure_ascii=False) + "\n")
+    # ---------- canon / plot (PR-3) ----------
+    async def _update_canon(self, truth: str, corpus_id: str, chunk_index: int) -> None:
+        """Extract entities from `truth` and merge into the corpus's CanonStore.
 
-    def _persist_snapshot(self) -> None:
-        """Save rules + chunks_processed for crash recovery. Never raises.
-
-        Failure here is logged but not propagated: the in-memory state remains
-        valid, the next chunk will retry, and DPO pairs are already on disk.
+        Failure is logged but never fatal: missing canon for one chunk just
+        means slightly worse retrieval on a future chunk, not pipeline death.
         """
         try:
+            from backend.memory.extractors import (
+                CANON_EXTRACTION_SYSTEM,
+                parse_json_array,
+                normalize_canon_records,
+            )
+            raw = await self.llm.complete(
+                system=CANON_EXTRACTION_SYSTEM,
+                user=truth,
+                temperature=0.2,
+                max_tokens=900,
+            )
+            records = normalize_canon_records(parse_json_array(raw))
+        except Exception as e:
+            await self._log(f"  ! canon 抽取失败: {e!r}")
+            return
+
+        if not records:
+            return
+
+        try:
+            from backend.memory import canon as _canon
+            store = _canon.get(corpus_id)
+            deltas = store.ingest_records(records, source="training", chunk_index=chunk_index)
+        except Exception as e:
+            await self._log(f"  ! canon 写入失败: {e!r}")
+            return
+
+        self.state.canon_count = len(store.entities)
+        await self._emit("canon", {
+            "deltas": [d.model_dump(mode="json") for d in deltas],
+            "total": self.state.canon_count,
+        })
+        if deltas:
+            await self._log(f"  Canon Δ {len(deltas)} (累计 {self.state.canon_count})")
+
+    async def _update_plot(self, truth: str, corpus_id: str, chunk_index: int) -> None:
+        try:
+            from backend.memory.extractors import (
+                PLOT_EXTRACTION_SYSTEM,
+                parse_json_array,
+                normalize_plot_records,
+            )
+            raw = await self.llm.complete(
+                system=PLOT_EXTRACTION_SYSTEM,
+                user=truth,
+                temperature=0.2,
+                max_tokens=700,
+            )
+            records = normalize_plot_records(parse_json_array(raw))
+        except Exception as e:
+            await self._log(f"  ! plot 抽取失败: {e!r}")
+            return
+
+        if not records:
+            return
+
+        try:
+            from backend.memory import plot as _plot
+            store = _plot.get(corpus_id)
+            new_events = store.ingest_records(records, source="training", chunk_index=chunk_index)
+        except Exception as e:
+            await self._log(f"  ! plot 写入失败: {e!r}")
+            return
+
+        self.state.plot_count = len(store.events)
+        await self._emit("plot", {
+            "deltas": [e.model_dump(mode="json") for e in new_events],
+            "total": self.state.plot_count,
+        })
+        if new_events:
+            await self._log(f"  Plot Δ {len(new_events)} (累计 {self.state.plot_count})")
+
+    # ---------- persistence ----------
+    @staticmethod
+    def _persist_dpo(corpus_id: str, pairs: List[DPOPair]) -> None:
+        if not pairs:
+            return
+        from backend.persistence import dpo_log as _dpo
+        for p in pairs:
+            _dpo.append_pair(corpus_id, p)
+
+    def _persist_snapshot(self) -> None:
+        """Save rules + chunks_processed for crash recovery. Never raises."""
+        if not self.current_corpus_id:
+            return
+        try:
             from backend.persistence import snapshot
-            snapshot.save(self.state.rules, self.state.chunks_processed)
+            snapshot.save(self.current_corpus_id, self.state.rules, self.state.chunks_processed)
         except Exception as e:
             print(f"[snapshot] save failed: {e!r}")
 
     def _persist_chunk_meta(self, req: TrainingRequest) -> None:
-        """Mark chunk_id as seen + advance the per-novel cursor. Never raises.
-
-        Quietly no-ops when the request lacks PR-2 metadata (manual callers).
-        Cursor advance requires the full set of slicing params; partial info
-        only updates the seen-set so idempotency still works.
-        """
-        if not (req.chunk_id and req.novel_sha256):
+        """Mark chunk_id as seen + advance the per-corpus cursor. Never raises."""
+        if not req.corpus_id:
             return
-        try:
-            from backend.persistence import seen_chunks
-            seen_chunks.add(req.novel_sha256, req.chunk_id)
-        except Exception as e:
-            print(f"[seen_chunks] add failed: {e!r}")
+        if req.chunk_id:
+            try:
+                from backend.persistence import seen_chunks
+                seen_chunks.add(req.corpus_id, req.chunk_id)
+            except Exception as e:
+                print(f"[seen_chunks] add failed: {e!r}")
 
         if (
-            req.novel_path is not None
+            req.novel_sha256 is not None
+            and req.novel_path is not None
             and req.chunk_size is not None
             and req.ctx_size is not None
             and req.overlap is not None
@@ -533,6 +668,7 @@ class EchoQuillAlchemist:
             try:
                 from backend.persistence import progress
                 progress.update(
+                    corpus_id=req.corpus_id,
                     novel_sha256=req.novel_sha256,
                     novel_path=req.novel_path,
                     chunk_size=req.chunk_size,
