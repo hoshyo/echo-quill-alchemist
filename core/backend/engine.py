@@ -103,24 +103,39 @@ class DualTowerJudge:
 # ---------------------------------------------------------------------------
 
 class LLMClient:
-    """Async LLM client supporting Anthropic and OpenAI via env vars.
+    """Async LLM client.
 
-    Env:
-      LLM_PROVIDER       "anthropic" | "openai"  (auto-detected if unset)
-      ANTHROPIC_API_KEY  required when provider=anthropic
-      ANTHROPIC_MODEL    default: claude-sonnet-4-6
-      OPENAI_API_KEY     required when provider=openai
-      OPENAI_MODEL       default: gpt-4o-mini
+    Credentials are resolved (and injected into os.environ) by `auth_resolver` at init.
+    Resolution order:  shell env > .env at repo root > ~/.claude/settings.json (CC Switch).
+
+    After resolution, these env vars drive behavior:
+      LLM_PROVIDER          "anthropic" | "openai"  (auto-detected from which key is set)
+      ANTHROPIC_AUTH_TOKEN  Claude-Code-style bearer token  (used as: Authorization: Bearer …)
+      ANTHROPIC_API_KEY     official sk-ant- key             (used as: x-api-key)
+      ANTHROPIC_BASE_URL    e.g. https://api.anthropic.com or a Claude-Code-compatible relay
+      ANTHROPIC_MODEL       default: claude-sonnet-4-6
+      OPENAI_API_KEY        for the OpenAI provider
+      OPENAI_BASE_URL       default: https://api.openai.com
+      OPENAI_MODEL          default: gpt-4o-mini
     """
 
     def __init__(self):
+        from backend.auth_resolver import resolve_and_inject
+
+        self.resolved = resolve_and_inject()
+
         forced = os.getenv("LLM_PROVIDER")
         if forced:
             self.provider = forced
-        elif os.getenv("ANTHROPIC_API_KEY"):
+        elif os.getenv("ANTHROPIC_AUTH_TOKEN") or os.getenv("ANTHROPIC_API_KEY"):
             self.provider = "anthropic"
-        else:
+        elif os.getenv("OPENAI_API_KEY"):
             self.provider = "openai"
+        else:
+            # nothing configured — defer the failure until first call so the dashboard
+            # can still load and display the UI in "no creds" mode.
+            self.provider = "anthropic"
+
         self.client = httpx.AsyncClient(timeout=120.0)
 
     async def aclose(self) -> None:
@@ -138,17 +153,29 @@ class LLMClient:
         return await self._openai(system, user, temperature, max_tokens)
 
     async def _anthropic(self, system, user, temperature, max_tokens) -> str:
-        key = os.getenv("ANTHROPIC_API_KEY")
-        if not key:
-            raise RuntimeError("ANTHROPIC_API_KEY not set")
+        auth_token = os.getenv("ANTHROPIC_AUTH_TOKEN")
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+        if not (auth_token or api_key):
+            raise RuntimeError(
+                "no Anthropic credentials found — set ANTHROPIC_AUTH_TOKEN or "
+                "ANTHROPIC_API_KEY in .env, or activate a CC Switch provider"
+            )
+
+        base_url = os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/")
         model = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+
+        headers: dict[str, str] = {
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        if auth_token:
+            headers["Authorization"] = f"Bearer {auth_token}"
+        else:
+            headers["x-api-key"] = api_key  # type: ignore[assignment]
+
         r = await self.client.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
+            f"{base_url}/v1/messages",
+            headers=headers,
             json={
                 "model": model,
                 "max_tokens": max_tokens,
@@ -165,9 +192,10 @@ class LLMClient:
         key = os.getenv("OPENAI_API_KEY")
         if not key:
             raise RuntimeError("OPENAI_API_KEY not set")
+        base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com").rstrip("/")
         model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
         r = await self.client.post(
-            "https://api.openai.com/v1/chat/completions",
+            f"{base_url}/v1/chat/completions",
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
             json={
                 "model": model,

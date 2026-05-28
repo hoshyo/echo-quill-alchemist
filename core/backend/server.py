@@ -33,6 +33,14 @@ REPO_ROOT = CORE_DIR.parent
 if str(CORE_DIR) not in sys.path:
     sys.path.insert(0, str(CORE_DIR))
 
+# When spawned detached on Windows, file-handle inheritance for stdout/stderr is
+# unreliable — start_services.py asks us to redirect ourselves via this env var.
+_log_target = os.getenv("ECHO_QUILL_LOG")
+if _log_target:
+    _log_f = open(_log_target, "a", encoding="utf-8", buffering=1)  # line-buffered
+    sys.stdout = _log_f  # type: ignore[assignment]
+    sys.stderr = _log_f  # type: ignore[assignment]
+
 from backend.engine import DualTowerJudge, EchoQuillAlchemist, LLMClient  # noqa: E402
 from backend.models import (  # noqa: E402
     AlchemistState,
@@ -96,7 +104,14 @@ async def lifespan(app: FastAPI):
     ALCHEMIST = EchoQuillAlchemist(judge=judge, llm=llm, broadcaster=manager.broadcast)
     QUEUE = asyncio.Queue()
     worker = asyncio.create_task(_worker())
-    print(f"[server] alchemist ready ({llm.provider}). ws=ws://localhost:8000/ws/alchemist")
+    src = (llm.resolved.get("source") or "none") if hasattr(llm, "resolved") else "none"
+    base = (llm.resolved.get("base_url") or "") if hasattr(llm, "resolved") else ""
+    masked = (llm.resolved.get("masked_key") or "") if hasattr(llm, "resolved") else ""
+    print(
+        f"[server] alchemist ready (provider={llm.provider}, creds={src}, "
+        f"base={base or '-'}, key={masked or '-'}). "
+        "ws=ws://localhost:8000/ws/alchemist"
+    )
     try:
         yield
     finally:

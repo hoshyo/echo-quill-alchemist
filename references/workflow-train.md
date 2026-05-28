@@ -25,11 +25,18 @@ Optional knobs the user might mention:
    │    on yes: install_deps.py --backend
    ├─ frontend_deps missing       → ASK to npm install
    │    on yes: install_deps.py --frontend
-   ├─ env not ok                  → ASK which provider + key
-   │    they paste a key here     → ensure_env.py --provider X --key Y
-   │    they want to do it later  → tell them where (.env at repo root) and abort
+   ├─ env.source = "claude_code"  → CC Switch is active; SKIP ensure_env entirely.
+   │                                Tell the user which base_url + masked_key + model
+   │                                will be used (so they know which budget is in play).
+   ├─ env.source = "shell_env"    → Same — credentials inherited from this shell.
+   │                                Often this is just CC Switch propagating into the env.
+   ├─ env.source = ".env"         → Project-local override; same — skip ensure_env.
+   ├─ env.source = "none"         → ASK which provider + key. Three options to offer:
+   │    a) "switch to a CC Switch profile and re-run" (best, no .env needed)
+   │    b) "I'll fill .env myself" (tell them the path; abort)
+   │    c) they paste a key here  → ensure_env.py --provider X --key Y
    ├─ services down               → start_services.py (waits for both ready)
-   └─ services already up         → keep them; do not restart unless .env changed
+   └─ services already up         → keep them; do not restart unless creds changed
 
 2. open_dashboard.py
    so the user has eyes on it before chunks start landing
@@ -37,7 +44,7 @@ Optional knobs the user might mention:
 3. ASK the user to confirm:
    - the novel path
    - the cost shape (e.g. "this is roughly 300 chunks × ~6 LLM calls = ~1800 calls;
-     keep going?")
+     keep going?") — and explicitly mention which provider/base_url will eat that cost
    - chunk_size / ctx if they specified non-defaults
 
 4. train.py --path "<absolute/path>" [--chunk_size N] [--ctx N] [--limit N]
@@ -46,6 +53,18 @@ Optional knobs the user might mention:
    If they want to know status, run doctor.py again — its `data` block has
    `chunks_processed`, `rules`, `dpo_pairs`.
 ```
+
+### Mid-run: switching CC Switch profile
+
+If the user switches CC Switch profiles while training is running, the running backend will
+NOT pick it up — credentials are read once at startup. Tell them, then on confirmation:
+
+```
+stop_services.py --backend
+start_services.py --backend
+```
+
+Existing in-memory state (rules, in-progress chunks) is lost; `data/dpo.jsonl` is preserved.
 
 ## Estimating cost before running
 

@@ -63,20 +63,43 @@ def _is_up(url: str, timeout: float = 1.5) -> bool:
         return False
 
 
-def _spawn(cmd: list[str], cwd: str, log_path) -> int:
-    """Spawn a detached child. Returns PID. stdout/stderr → log file."""
-    log = open(log_path, "ab")
-    kwargs: dict = dict(stdout=log, stderr=subprocess.STDOUT, cwd=cwd, env=os.environ.copy())
+def _spawn(cmd: list[str], cwd: str, log_path, redirect_via_env: bool) -> int:
+    """Spawn a detached child. Returns PID.
+
+    For our own Python server we ask it to self-redirect stdout/stderr by setting
+    `ECHO_QUILL_LOG=<log_path>` in the child's env (see core/backend/server.py).
+    That dodges the Windows-DETACHED_PROCESS file-handle-inheritance gotchas.
+
+    For npm (which we don't control) we still hand it a file via Popen.
+    """
+    env = os.environ.copy()
+    if redirect_via_env:
+        env["ECHO_QUILL_LOG"] = str(log_path)
+
     if IS_WIN:
-        kwargs["creationflags"] = (
-            subprocess.CREATE_NEW_PROCESS_GROUP | 0x00000008  # DETACHED_PROCESS
+        kwargs: dict = dict(
+            cwd=cwd,
+            env=env,
+            shell=True,
+            creationflags=(
+                subprocess.CREATE_NEW_PROCESS_GROUP | 0x00000008  # DETACHED_PROCESS
+            ),
         )
-        # On Windows we need shell=True for `npm` (it's npm.cmd, found via PATHEXT)
-        kwargs["shell"] = True
-    else:
-        kwargs["start_new_session"] = True
-    proc = subprocess.Popen(cmd, **kwargs)
-    return proc.pid
+        if not redirect_via_env:
+            log = open(log_path, "ab")
+            kwargs.update(stdout=log, stderr=subprocess.STDOUT)
+        proc = subprocess.Popen(cmd, **kwargs)
+        return proc.pid
+
+    log = open(log_path, "ab")
+    return subprocess.Popen(
+        cmd,
+        stdout=log if not redirect_via_env else None,
+        stderr=subprocess.STDOUT if not redirect_via_env else None,
+        cwd=cwd,
+        env=env,
+        start_new_session=True,
+    ).pid
 
 
 def _wait_until(url: str, label: str, timeout: float = 120.0) -> bool:
@@ -100,8 +123,9 @@ def start_backend(state: dict, wait: bool) -> dict:
         return existing
 
     log_path = LOGS_DIR / "backend.log"
-    cmd = [sys.executable, str(BACKEND_DIR / "server.py")]
-    pid = _spawn(cmd, cwd=str(CORE_DIR), log_path=log_path)
+    # -u: unbuffered stdio; server.py also self-redirects via ECHO_QUILL_LOG
+    cmd = [sys.executable, "-u", str(BACKEND_DIR / "server.py")]
+    pid = _spawn(cmd, cwd=str(CORE_DIR), log_path=log_path, redirect_via_env=True)
     rec = {
         "pid": pid,
         "port": BACKEND_PORT,
@@ -125,9 +149,8 @@ def start_frontend(state: dict, wait: bool) -> dict:
         return existing
 
     log_path = LOGS_DIR / "frontend.log"
-    # `npm run dev` resolves vite from frontend/node_modules/.bin
-    cmd = ["npm", "run", "dev"] if IS_WIN else ["npm", "run", "dev"]
-    pid = _spawn(cmd, cwd=str(FRONTEND_DIR), log_path=log_path)
+    cmd = ["npm", "run", "dev"]
+    pid = _spawn(cmd, cwd=str(FRONTEND_DIR), log_path=log_path, redirect_via_env=False)
     rec = {
         "pid": pid,
         "port": FRONTEND_PORT,

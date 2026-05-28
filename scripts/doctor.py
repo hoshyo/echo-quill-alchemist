@@ -26,12 +26,18 @@ import urllib.request
 
 from _paths import (
     BACKEND_URL,
+    CORE_DIR,
     DPO_FILE,
     ENV_FILE,
     FRONTEND_DIR,
     FRONTEND_URL,
     STATE_FILE,
 )
+
+# pull the same resolver the backend uses so the JSON we emit and the env the
+# backend sees agree exactly.
+sys.path.insert(0, str(CORE_DIR))
+from backend.auth_resolver import resolve as resolve_provider  # noqa: E402
 
 
 REQUIRED_PY_PACKAGES = [
@@ -75,22 +81,25 @@ def _check_py_packages() -> tuple[bool, list[str]]:
 
 
 def _check_env() -> dict:
-    if not ENV_FILE.exists():
-        return {"ok": False, "provider": None, "has_key": False}
-    text = ENV_FILE.read_text(encoding="utf-8", errors="ignore")
-    has_anthropic = any(
-        line.strip().startswith("ANTHROPIC_API_KEY=") and line.strip().split("=", 1)[1].strip()
-        for line in text.splitlines()
-    )
-    has_openai = any(
-        line.strip().startswith("OPENAI_API_KEY=") and line.strip().split("=", 1)[1].strip()
-        for line in text.splitlines()
-    )
-    if has_anthropic:
-        return {"ok": True, "provider": "anthropic", "has_key": True}
-    if has_openai:
-        return {"ok": True, "provider": "openai", "has_key": True}
-    return {"ok": False, "provider": None, "has_key": False}
+    """Resolve LLM credentials the same way the backend does.
+
+    Output keeps the legacy keys (`ok`, `provider`, `has_key`) so older callers don't
+    break, and adds the full resolution detail (`source`, `base_url`, etc).
+    """
+    r = resolve_provider()
+    has = bool(r.get("has_credentials"))
+    return {
+        "ok": has,
+        "provider": r.get("provider"),
+        "has_key": has,
+        "source": r.get("source"),                # "shell_env" | ".env" | "claude_code" | "none"
+        "auth_style": r.get("auth_style"),        # "auth_token" | "api_key" | None
+        "base_url": r.get("base_url"),
+        "model": r.get("model"),
+        "masked_key": r.get("masked_key"),
+        "dotenv_present": ENV_FILE.exists(),
+        "notes": r.get("notes", []),
+    }
 
 
 def _http_get(url: str, timeout: float = 1.5) -> dict | None:

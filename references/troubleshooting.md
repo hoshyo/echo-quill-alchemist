@@ -34,15 +34,50 @@ Likely causes, check the backend log (`core/data/logs/backend.log`):
 - **Missing API key** is *not* the cause here — the backend starts fine without one. The
   worker only fails when chunks arrive.
 
-## Worker logs `[FATAL] OPENAI_API_KEY not set` (or ANTHROPIC_API_KEY)
+## Worker logs `[FATAL] no Anthropic credentials …` (or `OPENAI_API_KEY not set`)
 
-The user has no key in `.env`, or `.env` was modified after the backend started. Two fixes:
+Run `python scripts/detect_provider.py`. If it says `"source": "none"`, no credentials are
+visible to the backend in *any* of: shell env, `.env`, or `~/.claude/settings.json`. Three
+ways to fix:
 
-1. `ensure_env.py --provider X --key Y` (only if the user hands you the key in chat)
-2. Tell them to fill `.env` themselves.
+1. The user activates a CC Switch profile (their normal workflow), then restart backend.
+2. `ensure_env.py --provider X --key Y` (only if they hand you the key in chat).
+3. Tell them to fill `.env` themselves.
 
-Either way, **restart the backend** (`stop_services.py --backend && start_services.py
---backend`) — it reads `.env` once at startup.
+If `detect_provider.py` says `"source": "claude_code"` but the worker still complains, the
+backend was started **before** the CC Switch profile was activated — it has stale env. Fix:
+`stop_services.py --backend && start_services.py --backend`.
+
+## CC Switch swap didn't take effect
+
+`detect_provider.py` shows the new profile, but the backend is still talking to the old one.
+This is by design — credentials are loaded once at startup. After any CC Switch change run:
+
+```
+python scripts/stop_services.py --backend
+python scripts/start_services.py --backend
+```
+
+The `data/dpo.jsonl` artifact survives; in-memory rules and DPO history reset.
+
+## Backend startup line shows `creds=shell_env` but you expected `claude_code`
+
+Same thing in disguise. When Claude Code (and CC Switch through it) sets
+`ANTHROPIC_AUTH_TOKEN` into the shell environment, our resolver legitimately reports it as
+`shell_env` (it really is *in* the shell now). Compare the `base_url` and `masked_key` in
+the startup line against `~/.claude/settings.json`'s `env` block — if they match, you have
+the CC Switch profile, just labeled by its more specific source.
+
+## Custom relay (`ANTHROPIC_BASE_URL=https://your-host`) returns 404 on /v1/messages
+
+Your relay doesn't implement Anthropic's Messages API at the standard path. Options:
+
+- Check the relay's docs — it may need a different path or version header.
+- Some relays expect `x-api-key` only (no Bearer); others want Bearer only. The backend
+  picks based on which env var is set: `ANTHROPIC_AUTH_TOKEN` → Bearer,
+  `ANTHROPIC_API_KEY` → x-api-key. Set the one your relay accepts.
+- If the relay is OpenAI-compatible instead of Anthropic-compatible, set
+  `OPENAI_API_KEY` + `OPENAI_BASE_URL` in `.env` and let `LLM_PROVIDER=openai`.
 
 ## `trigger_training` returns `400 Bad Request: error parsing the body`
 
