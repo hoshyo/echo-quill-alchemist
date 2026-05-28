@@ -25,6 +25,12 @@ Echo-Quill Alchemist 是一个本地系统，把任意小说切成 `(上文, 真
 
 ## 快速开始
 
+### 安装方式
+
+```bash
+npx skills add hoshyo/echo-quill-alchemist
+```
+
 ### 推荐方式 —— 跟 Claude 说话
 
 ```
